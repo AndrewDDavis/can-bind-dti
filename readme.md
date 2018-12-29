@@ -2,6 +2,10 @@
 
 This repository holds the BASH shell and python source code of programs used to preprocess and analyze the DTI data for the CAN-BIND-1 study. This code was used the produce the manuscript by Davis et al.: "White Matter Indices of Medication Response in Major Depression".
 
+The code release associated with this publication has a DOI:  
+[![DOI](https://zenodo.org/badge/163243086.svg)](https://zenodo.org/badge/latestdoi/163243086)
+
+
 ## Installation
 
 The data files and code/script repository typically live in *~/Documents/Research_Projects/CAN-BIND_DTI*. The notes and manuscripts associated with the analysis live in *~/Dropbox/Research_Projects/CAN-BIND_DTI/doc*, and the results live in *~/Dropbox/Research_Projects/CAN-BIND_DTI/group_results*.
