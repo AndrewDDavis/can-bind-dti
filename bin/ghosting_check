@@ -1,0 +1,37 @@
+#!/bin/bash
+
+# v0.1 (Feb 2018) by Andrew Davis (addavis@gmail.com)
+
+# Generates an image to visually check ghosting severity of a DTI volume
+
+# Example:
+# ghosting_check dwi_merged-ecc.nii.gz qc/ghosting_check.png
+
+# Two arguments are input nifti (will take 1st volume), and output png
+
+[[ $# -eq 0 ]] && { echo "specify args: input nifti and output png"; exit 1; }
+
+infile="$1"
+outfile="$2"
+
+[[ -e "$infile" ]] || { echo "file not found: $infile"; exit 2; }
+[[ -e qc/dwi-lv_roi.nii.gz ]] || { echo "file not found: dwi-lv_roi"; exit 2; }
+
+# make a temp file from first volume of input nifti
+tmpd=$(mktemp -d /tmp/ghosting_check.XXXXXX)
+fslroi "$infile" ${tmpd}/vol1 0 1
+
+# # get robust intensity range max
+# highlev=$(fslstats ${tmpd}/vol1 -r | cut -d ' ' -f 2)
+
+# get CSF signal from lateral ventricles
+csflev=$(fslstats ${tmpd}/vol1 -k qc/dwi-lv_roi -p 50 | tr -d ' ')
+
+# set that to 1000
+f=$(pycalc "1000/$csflev")
+fslmaths ${tmpd}/vol1 -mul "$f" ${tmpd}/vol1-norm
+
+# grab a screenshot with low max limit to see noise
+slicer ${tmpd}/vol1-norm -i 0 25 -a "$outfile"
+
+/bin/rm -r ${tmpd}

@@ -1,0 +1,129 @@
+#!/bin/bash
+
+# Extract data from ROIs
+# Run this from an exam directory with a dti_preprocessed dir in it, after creating jhusp data
+
+# v0.3 (Mar 2018) by Andrew Davis (addavis@gmail.com)
+
+# defaults and input args
+roi_set=four_rois
+
+if [[ $1 == "--34" ]]; then
+    echo "34 no longer used."
+    exit 2
+elif [[ $1 == "--forty" ]]; then
+    roi_set=forty_rois
+elif [[ -n "${1:-}" ]]; then
+    echo "unkown argument: $1"
+    exit 2
+fi
+
+# Check for expected files
+prep_dir=dti_preprocessed
+[[ -d "${prep_dir}" ]] || { echo "Error: prep_dir (${prep_dir}) not found in ${PWD}."; exit 2; }
+
+jhu_dir=dti_preprocessed/jhu-space
+[[ -d "${jhu_dir}" ]] || { echo "Error: jhu_dir (${jhu_dir}) not found in ${PWD}."; exit 2; }
+
+rois_dir="$HOME"/Documents/CAN-BIND/CAN-BIND_DTI/data/ROIs
+[[ -d "${rois_dir}" ]] || { echo "Error: rois_dir ($rois_dir) not found."; exit 2; }
+
+# Create thresholded FA and MD image if necessary
+[[ $(imtest "${jhu_dir}"/dti-thr20FA_mask) -eq 1 ]] \
+  || fslmaths ${jhu_dir}/dti-fsl_FA-jhusp \
+              -thr 0.2 -bin \
+              ${jhu_dir}/dti-thr20FA_mask \
+              -odt char
+[[ $(imtest "${jhu_dir}"/dti-thr30FA_mask) -eq 1 ]] \
+  || fslmaths ${jhu_dir}/dti-fsl_FA-jhusp \
+              -thr 0.3 -bin \
+              ${jhu_dir}/dti-thr30FA_mask \
+              -odt char
+[[ $(imtest "${jhu_dir}"/dti-thrMD_mask) -eq 1 ]] \
+  || fslmaths ${jhu_dir}/dti-fsl_MD-jhusp \
+              -thr 0.001 -bin \
+              ${jhu_dir}/dti-thrMD_mask \
+              -odt char
+
+# threshold ROI masks -- don't do this anymore, just use template ROIs and don't skew the distributions
+# if [[ $roi_set == four_rois ]]; then
+#     mkdir -p ${jhu_dir}/4_ROIs
+#     fslmaths "${rois_dir}"/4_ROIs/CC-ROI \
+#              -mul ${jhu_dir}/dti-thr20FA_mask \
+#              ${jhu_dir}/4_ROIs/CC-ROI-masked \
+#              -odt char
+#     fslmaths "${rois_dir}"/4_ROIs/IC-ROI \
+#              -mul ${jhu_dir}/dti-thr20FA_mask \
+#              ${jhu_dir}/4_ROIs/IC-ROI-masked \
+#              -odt char
+#     imcp "${rois_dir}"/4_ROIs/Caudate_nucleus_ROI_from_JHUDWI_2mm \
+#          ${jhu_dir}/4_ROIs/CN-ROI
+#     fslmaths "${rois_dir}"/4_ROIs/Lat_vent_ROI_from_JHUT2 \
+#              -mul ${jhu_dir}/dti-thrMD_mask \
+#              ${jhu_dir}/4_ROIs/LV-ROI-masked \
+#              -odt char
+# elif [[ $roi_set == thirtyfour_rois ]]; then
+#     mkdir -p ${jhu_dir}/34_ROIs
+#     for r in "${rois_dir}"/34_ROIs/ROI-[0-9][0-9].nii.gz; do
+#         r="$(basename ${r%.nii.gz})"
+#         fslmaths "$r" \
+#                  -mul ${jhu_dir}/dti-thr20FA_mask \
+#                  ${jhu_dir}/34_ROIs/"${r}"-masked \
+#                  -odt char
+#     done
+# fi
+
+# Get subjID for output
+subjID=$(echo $(basename "$PWD") | cut -d '_' -f 1,2,3)
+[[ ${#subjID} == 11 ]] || { echo "ERROR: subjID not as expected: ${subjID}"; exit 2; }
+
+# Write to output CSV files
+if [[ $roi_set == four_rois ]]; then
+    outfile=${jhu_dir}/JHU-4ROI_data.csv
+    echo "subjID,dti-fsl_FA,,,,dti-fsl_L1,,,,dti-fsl_RD,,,,dti-fsl_MD,,,,dti-fsl_sse,,,,dti-afni_FA,,,,dti-afni_L1,,,,dti-afni_RD,,,,dti-afni_MD" > "${outfile}"
+    echo ",CC,IC,CN,LV,CC,IC,CN,LV,CC,IC,CN,LV,CC,IC,CN,LV,CC,IC,CN,LV,CC,IC,CN,LV,CC,IC,CN,LV,CC,IC,CN,LV,CC,IC,CN,LV" >> "${outfile}"
+    printf "${subjID}," >> "${outfile}"
+
+    for i in dti-fsl_FA dti-fsl_L1 dti-fsl_RD dti-fsl_MD dti-fsl_sse \
+             dti-afni_FA dti-afni_L1 dti-afni_RD dti-afni_MD; do
+
+        fslstats ${jhu_dir}/${i}-jhusp -k "${rois_dir}"/4_ROIs/CC-ROI -m | tr ' ' ',' | tr -d '\n' >> "${outfile}"
+        fslstats ${jhu_dir}/${i}-jhusp -k "${rois_dir}"/4_ROIs/IC-ROI -m | tr ' ' ',' | tr -d '\n' >> "${outfile}"
+        fslstats ${jhu_dir}/${i}-jhusp -k "${rois_dir}"/4_ROIs/Caudate_nucleus_ROI_from_JHUDWI_2mm -m | tr ' ' ',' | tr -d '\n' >> "${outfile}"
+        fslstats ${jhu_dir}/${i}-jhusp -k "${rois_dir}"/4_ROIs/Lat_vent_ROI_from_JHUT2 -m | tr -d ' \n' >> "${outfile}"
+        [[ $i == dti-afni_MD ]] || printf ',' >> "${outfile}"
+    done
+    printf '\n' >> "${outfile}"
+elif [[ $roi_set == forty_rois ]]; then
+    param_types=(FA L1 RD MD)
+    for pt in ${param_types[@]}; do
+        outfile=${jhu_dir}/JHU-40ROI_${pt}_data.csv
+
+        # printf "subjID," > "$outfile"
+        # # Get ROI names from index
+        # for r in "${rois_dir}"/40_ROIs/ROI-[0-9][0-9].nii.gz; do
+        #     r_no=$(basename ${r%.nii.gz})
+        #     r_no=${r_no#ROI-}
+        #     r_name="$(grep "^${r_no}" "${rois_dir}"/JHU-40_ROIs_selected.txt)"
+        #     r_name="$(echo "${r_name#[0-9][0-9] }" | tr ' ' '_' | tr -d '()')"
+        #     [[ -n "${r_name:-}" ]] || { echo "ERROR: empty r_name"; exit 2; }
+        #     printf "${r_name}," >> "$outfile"
+        # done
+        # sed --in-place '$ s/,$//' "$outfile"  # strip trailing comma
+        # printf "\n" >> "$outfile"
+
+        # print this manually since it never changes, uncomment above to generate dynamically
+        printf "subjID,Genu_of_corpus_callosum,Body_of_corpus_callosum,Splenium_of_corpus_callosum,Fornix_(column_and_body_of_fornix),Superior_cerebellar_peduncle_R,Superior_cerebellar_peduncle_L,Cerebral_peduncle_R,Cerebral_peduncle_L,Anterior_limb_of_internal_capsule_R,Anterior_limb_of_internal_capsule_L,Posterior_limb_of_internal_capsule_R,Posterior_limb_of_internal_capsule_L,Retrolenticular_part_of_internal_capsule_R,Retrolenticular_part_of_internal_capsule_L,Anterior_corona_radiata_R,Anterior_corona_radiata_L,Superior_corona_radiata_R,Superior_corona_radiata_L,Posterior_corona_radiata_R,Posterior_corona_radiata_L,Posterior_thalamic_radiation_(include_optic_radiation)_R,Posterior_thalamic_radiation_(include_optic_radiation)_L,Sagittal_stratum_(include_inferior_longitidinal_fasciculus_and_inferior_fronto-occipital_fasciculus)_R,Sagittal_stratum_(include_inferior_longitidinal_fasciculus_and_inferior_fronto-occipital_fasciculus)_L,External_capsule_R,External_capsule_L,Cingulum_(cingulate_gyrus)_R,Cingulum_(cingulate_gyrus)_L,Cingulum_(hippocampus)_R,Cingulum_(hippocampus)_L,Fornix_(cres)_/_Stria_terminalis_(can_not_be_resolved_with_current_resolution)_R,Fornix_(cres)_/_Stria_terminalis_(can_not_be_resolved_with_current_resolution)_L,Superior_longitudinal_fasciculus_R,Superior_longitudinal_fasciculus_L\n" >> "$outfile"
+
+        # Now print the values
+        printf "${subjID}," >> "$outfile"
+        for r in "${rois_dir}"/40_ROIs/ROI-[0-9][0-9].nii.gz; do
+            #r="$(basename ${r%.nii.gz})"
+            fslstats ${jhu_dir}/dti-fsl_${pt}-jhusp -k "$r" -m | tr ' ' ',' | tr -d ' \n' >> "$outfile"
+        done
+        sed --in-place '$ s/,$//' "$outfile"
+        printf "\n" >> "$outfile"
+    done
+fi
+
+exit 0

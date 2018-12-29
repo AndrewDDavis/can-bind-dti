@@ -1,0 +1,422 @@
+#!/bin/bash
+
+# Preprocess DTI data in NIfTI format
+# See print_usage below for syntax info
+
+# v0.5 (Feb 2018) by Andrew Davis (addavis@gmail.com)
+#
+# Distributed under The MIT License (MIT).
+#   See http://opensource.org/licenses/MIT for details.
+
+# For a good review of practical DTI processing considerations see:
+# Soares JM, Marques P, Alves V, Sousa N. A hitchhiker’s guide to diffusion tensor imaging. Frontiers in Neuroscience. 2013;7:31. doi:10.3389/fnins.2013.00031.
+
+# For a guide to FSL's diffusion (FDT) tools, see:
+#   http://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FDT/UserGuide
+# For useful practica, see:
+#   FDT & TBSS: http://fsl.fmrib.ox.ac.uk/fslcourse/lectures/practicals/fdt1/
+#   Tractography: http://fsl.fmrib.ox.ac.uk/fslcourse/lectures/practicals/fdt2/
+
+# Order of operations from the FSL User Guide:
+#   http://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FDT/UserGuide#Processing_pipeline
+# 1. study or scanner-specific pre-processing
+# 2. Eddy current correction
+# 3. Brain extraction
+# 4. Fitting of diffusion tensors on corrected data (dtifit)
+# 5. Fitting of the probabilistic diffusion model (bedpostx)
+# 6. Registration
+# 7. Probabilistic tractography (probtrackx)
+# 8. Further post-processing of probtrackx outputs
+#
+# This script can do 1-4 and 6.
+
+
+# Robust scriptng options
+set -o nounset
+set -o errexit
+set -o pipefail
+shopt -s nullglob
+
+print_usage () {
+cat << EOF
+
+   $(basename $0)
+   --------------
+
+   This script runs the standard steps to prepare a volume for DTI analysis
+   using FSL and AFNI tools. Run the script in an exam directory, where each
+   series is a NIfTI file (.nii or .nii.gz) with bval and bvec files as output
+   by dcm2nii (from the mricron package by Rorden). The script expects to find
+   the following files in the exam directory:
+     - NIfTI files named dti, or dti_a, dti_b, etc.
+     - *.bval and *.bvec files named identically to the NIfTIs
+
+   Usage: $(basename $0) [options] -n <nsa>
+
+   Required Arguments:
+      -n <nsa> : number of expected DTI scans per exam
+                    (eg. 3 for dti_a, dti_b, and dti_c)
+
+   Options:
+     -a <anat> : brain-extracted anatomical NIfTI, if reg from anat to
+                    dti is desired (eg. t1_anatomical-256-biascorr_brain.nii)
+       --sepb0 : Data is split into dti_30dir and dti_b0 files (QNS and UBC)
+        --cbge : Data is CAN-BIND GE type (37 frames in merged data)
+        --cbsp : Data is CAN-BIND Siemens/Philips type (32 frames in merged data)
+        --cbsb : Data is CAN-BIND Philips B type (37 frames in merged data)
+      --cbubcb : Data is CAN-BIND UBC_B type (31 frames in merged data)
+        --walt : Data is Walter\'s type (68 frames in merged data)
+          --df : specify other diffusion frames (e.g. 96)
+      --noafni : Do not generate tensor with AFNI tools
+       --nodtk : Do not run Diffusion Toolkit and TrackVis
+   --nofmrib58 : Do not normalize to FMRIB58 FA template
+    --nochecks : Disable checking of number of dwi volumes
+        --nods : Do not downsample UCA images
+     --verbose : write many more messages to the log
+
+EOF
+}
+
+# Defaults
+sep_b0=False
+diff_frames=68
+run_afni=True
+run_dtk=True
+check_vols=True
+downsample_uca=True
+norm_fmrib58=True
+verb_flag=False
+prep_dir=dti_preprocessed
+logfile="${prep_dir}/dti_preprocess.log"
+
+# Parse arguments
+while [ $# -gt 0 ]; do
+   case "$1" in
+            -a ) anat="$2"; shift;;
+            -n ) dti_nsa="$2"; shift;;
+       --sepb0 ) sep_b0=True;;
+        --cbge ) diff_frames=37;;   # 31 dirs + 6 b=0 in one file
+        --cbsp ) diff_frames=32; sep_b0=True;;   # 30 dirs + 1 b=0 in one file, 1 b=0 in another file
+        --cbsb ) diff_frames=36; sep_b0=True;;   # 30 dirs + 1 b=0 in one file, 5 b=0 in other files
+      --cbubcb ) diff_frames=31;;   # for UBC_B -- 30 dirs + 1 b=0 in one file only (ignore corrupt DTI_5T2_b0.nii.gz)
+        --walt ) diff_frames=68;;   # 29 dirs + 5 b=0 in each file x two files
+          --df ) diff_frames="$2"; shift;;
+      --noafni ) run_afni=False;;
+       --nodtk ) run_dtk=False;;
+   --nofmrib58 ) norm_fmrib58=False;;
+    --nochecks ) check_vols=False;;
+        --nods ) downsample_uca=False;;
+     --verbose ) verb_flag=True;;
+     -h|--help ) print_usage; exit 0;;
+             * ) printf "Unrecognized option '$1'.\nUse '--help' for usage.\n"; exit 2;;
+ #          -* ) echo "unrecognized option '$1'"; print_usage; exit 2;;
+ #           * ) break;;
+   esac
+   shift    # remove argument that has been handled
+done
+
+# Check arguments
+# [[ -z ${anat:-} ]] \
+#     && { printf "Error: must specify a brain-extracted anatomical.\nUse '--help' for usage.\n"; exit 2; } \
+#     || { [[ -e "$anat" ]] || { echo "Error: anat not found: '$anat'"; exit 2; } }
+
+[[ -z ${dti_nsa:-} ]] && { printf "Error: must specify expected number of DTI scans.\nUse '--help' for usage.\n"; exit 2; }
+
+# Check for expected files
+if [[ $sep_b0 == True ]]; then
+    dwi_files=($(find . -maxdepth 1 \( -name 'dti_[0-9]*dir_[a-z].nii*' \
+                                    -o -name 'dti_[0-9]*dir.nii*' \
+                                    -o -name 'DTI_30dirs_1T2_b1000.nii*' \) | sort))
+    dwi_b0_files=($(find . -maxdepth 1 \( -name 'dti_b0_[a-z].nii*' \
+                                       -o -name 'dti_b0.nii*' \
+                                       -o -name 'DTI_1T2_b0_[A-Z].nii*' \) | sort))
+    dwi_files_noext=($(for df in ${dwi_files[@]}; do $FSLDIR/bin/remove_ext "$df"; done))
+    bval_files=($(for df in ${dwi_files_noext[@]}; do echo "${df}.bval"; done))
+    for df in ${bval_files[@]}; do [[ -e "${df}" ]] || { echo "Error: ${df} not found."; exit 2; }; done
+    #bval_files=($(find . -maxdepth 1 \( -name 'dti_[0-9]*dir_[a-z].bval' -o -name 'dti_[0-9]*dir.bval' \) | sort))
+    bvec_files=($(for df in ${dwi_files_noext[@]}; do echo "${df}.bvec"; done))
+    for df in ${bvec_files[@]}; do [[ -e "${df}" ]] || { echo "Error: ${df} not found."; exit 2; }; done
+    #bvec_files=($(find . -maxdepth 1 \( -name 'dti_[0-9]*dir_[a-z].bvec' -o -name 'dti_[0-9]*dir.bvec' \) | sort))
+else
+    dwi_files=($(find . -maxdepth 1 \( -name 'dti_[a-z].nii*' \
+                                    -o -name 'dti.nii*' \
+                                    -o -name 'DTI_31dirs_6T2_b1000.nii*' \
+                                    -o -name 'DTI_30dirs_1T2_b1000.nii*' \) | sort))
+    dwi_files_noext=($(for df in ${dwi_files[@]}; do $FSLDIR/bin/remove_ext "$df"; done))
+    bval_files=($(for df in ${dwi_files_noext[@]}; do echo "${df}.bval"; done))
+    for df in ${bval_files[@]}; do [[ -e "${df}" ]] || { echo "Error: ${df} not found."; exit 2; }; done
+    #bval_files=($(find . -maxdepth 1 \( -name 'dti_[a-z].bval' -o -name 'dti.bval' \) | sort))
+    bvec_files=($(for df in ${dwi_files_noext[@]}; do echo "${df}.bvec"; done))
+    for df in ${bvec_files[@]}; do [[ -e "${df}" ]] || { echo "Error: ${df} not found."; exit 2; }; done
+    #bvec_files=($(find . -maxdepth 1 \( -name 'dti_[a-z].bvec' -o -name 'dti.bvec' \) | sort))
+fi
+[[ ${#dwi_files[@]} == $dti_nsa ]] \
+    || { echo "Error: expected $dti_nsa dti_* files, found ${#dwi_files[@]} in $(basename $PWD)."; exit 2; }
+[[ ${#bval_files[@]} == $dti_nsa ]] \
+    || { echo "Error: expected $dti_nsa *.bval files, found ${#bval_files[@]} in $(basename $PWD)."; exit 2; }
+[[ ${#bvec_files[@]} == $dti_nsa ]] \
+    || { echo "Error: expected $dti_nsa *.bvec files, found ${#bvec_files[@]} in $(basename $PWD)."; exit 2; }
+
+# FSL availability check. Some tools also require that FSLDIR be set in the environment
+if ! which fsl > /dev/null; then
+    echo "Error: FSL not found on path."
+    exit 2
+elif [[ -z ${FSLDIR:-} ]]; then
+    echo "Error: FSLDIR not set."
+    exit 2
+fi
+
+# Check for Diffusion Toolkit
+if { [[ $run_dtk == True ]] && ! which dti_tracker > /dev/null; } \
+|| { [[ $run_dtk == True ]] && ! which spline_filter > /dev/null; }; then
+    echo "Warning: Diffusion Toolkit and TrackVis not found on path."
+    echo "       : Disabling fibre tracking with dti_tracker."
+    run_dtk=False
+fi
+
+# Check for AFNI
+if [[ $run_afni == True ]] && ! which 3dDWItoDT > /dev/null; then
+    echo "Warning: AFNI (3dDWItoDT) not found on path."
+    echo "       : Disabling tensor generation with AFNI."
+    run_afni=False
+fi
+
+# Check for scripts
+if ! which rotatebvecs > /dev/null; then
+    echo "Error: rotatebvecs not found on path."
+    exit 2
+elif [[ $run_afni == True ]] && ! which bvectrans > /dev/null; then
+    echo "Error: bvectrans not found on path."
+    exit 2
+fi
+
+# Output directory check
+[[ -d ${prep_dir} ]] \
+  && { echo "Warning: directory exists in $(basename $PWD): ${prep_dir}.  Skipping..."; exit 0; } \
+  || { mkdir ${prep_dir}; }
+
+
+# Start the main work
+date | tee "${logfile}"
+echo "Pre-processing $dti_nsa DTI scan(s) for exam $(basename $PWD)..." | tee -a "${logfile}"
+printf "Redirecting output to ${logfile}\n\n"
+exec >> "${logfile}"
+exec 2>&1
+[[ verb_flag == True ]] && set -x
+
+# Downsample artificial 256x256 image to 96x96 for UCA acquired images
+#   maybe better to try `-applyxfm -usesqform -out brain-MNI152`
+if [[ $(fslval "${dwi_files[0]}" dim1) -eq 256 ]] && [[ $downsample_uca == True ]]; then
+    for dtifile in ${dwi_files[@]}; do
+        fpref=$("${FSLDIR}"/bin/remove_ext "$dtifile")
+        # Usage: fslcreatehd <xsize> <ysize> <zsize> <tsize> <xvoxsize> <yvoxsize> <zvoxsize> <tr> <xorigin> <yorigin> <zorigin> <datatype> <headername>
+        p=($(fslval "$fpref" dim1)
+           $(fslval "$fpref" dim2)
+           $(fslval "$fpref" dim3)
+           $(fslval "$fpref" dim4)
+           $(fslval "$fpref" pixdim1)
+           $(fslval "$fpref" pixdim2)
+           $(fslval "$fpref" pixdim3)
+           $(fslval "$fpref" pixdim4)
+           $(fslval "$fpref" datatype))
+        fslcreatehd 96 96 ${p[2]} 1 2.5 2.5 2.5 ${p[7]} 0 0 0 ${p[8]} "$fpref"-96_ref
+
+        echo "Downsampling $fpref (back) to 96x96..."
+        echo "Warning -- this is known to cause problems!"
+        "${FSLDIR}"/bin/immv "$fpref" "$fpref"-orig_256
+        # flirt -in "$fpref"-orig_256 -out "$fpref" -ref "$fpref"-96_ref \
+        #       -applyxfm -init "$FSLDIR"/etc/flirtsch/ident.mat -interp sinc
+        flirt -in "$fpref"-orig_256 -out "$fpref" -ref "$fpref"-96_ref \
+              -applyxfm -usesqform -interp spline
+        "$FSLDIR"/bin/imrm "$fpref"-96_ref
+    done
+fi
+
+# Merge DTI volumes and bval/bvec files
+echo "Merging DTI series..."
+if [[ $sep_b0 == True ]]; then
+    # merge images including b=0 files
+    fslmerge -t ${prep_dir}/dwi_merged ${dwi_files[@]} ${dwi_b0_files[@]}
+
+    # make bval and bvec files for b=0 images
+    for f in ${dwi_b0_files[@]}; do
+        p=$("$FSLDIR"/bin/remove_ext "$f")
+
+        echo 0 > "${p}".bval
+        bval_files+=("${p}".bval)
+
+        printf "0\n0\n0\n" > "${p}".bvec
+        bvec_files+=("${p}".bvec)
+    done
+else
+    # merge images
+    fslmerge -t ${prep_dir}/dwi_merged ${dwi_files[@]}
+fi
+
+# merge bval/bvec files
+paste -d ' ' ${bval_files[@]} > ${prep_dir}/dwi_merged.bval
+paste -d ' ' ${bvec_files[@]} > ${prep_dir}/dwi_merged.bvec
+
+printf "Done (Merging).\n\n"
+
+# Ensure paramaters for the DTI are as expected 
+if [[ $check_vols == True ]]; then
+    echo "Checking..."
+    diff_bvecs=$((diff_frames*3))
+    [[ $(wc -w ${prep_dir}/dwi_merged.bval | sed 's/^[ \t]*\([0-9]\{1,\}\).*/\1/') == "$diff_frames" ]] || { echo "error: expected $diff_frames bvals in merged data set."; exit 2; }
+    [[ $(wc -w ${prep_dir}/dwi_merged.bvec | sed 's/^[ \t]*\([0-9]\{1,\}\).*/\1/') == "$diff_bvecs" ]] || { echo "error: expected $diff_bvecs bvecs in merged data set."; exit 2; }
+    printf "Found $diff_frames DWI frames as expected.\n\n"
+fi
+
+
+# Eddy current correction (use vol 1 as reference (if it is b=0) as #0 sometimes has artifact)
+echo "Eddy current correction..."
+vol0_bval=$(cut -d ' ' -f 1 ${prep_dir}/dwi_merged.bval)
+vol1_bval=$(cut -d ' ' -f 2 ${prep_dir}/dwi_merged.bval)
+if [[ $vol1_bval -eq 0 ]]; then
+    ecc_ref_vol=1
+elif [[ $vol0_bval -eq 0 ]]; then
+    ecc_ref_vol=0
+else
+    echo "Error: could not find a b=0 ref for ECC."
+    exit 2
+fi
+echo "  ECC ref vol: $ecc_ref_vol"
+eddy_correct ${prep_dir}/dwi_merged ${prep_dir}/dwi_merged-ecc $ecc_ref_vol spline
+printf "Done (ECC).\n\n"
+
+
+# It's nice to correct the bvecs here.  See:
+#   http://onlinelibrary.wiley.com/doi/10.1002/mrm.21890/epdf
+# However, it makes very little difference in my tests (<1% of vector mags), and see here
+# for a discussion on why it may not be desirable for ECC rather than motion:
+#   https://www.jiscmail.ac.uk/cgi-bin/webadmin?A2=ind0903&L=FSL&D=0&P=524568
+# Ultimately, it may be useful for larger motion, and shouldn't hurt for the amount of ECC present.
+echo "Correcting bvecs..."
+# consider using fdt_rotate_bvecs here instead
+rotatebvecs ${prep_dir}/dwi_merged.bvec ${prep_dir}/dwi_merged-eccrot.bvec ${prep_dir}/dwi_merged-ecc.ecclog -k
+
+# record motion correction parameters in a column format
+mkdir ${prep_dir}/dwi_ecc.xfms
+for xfm_file in ${prep_dir}/dwi_merged-ecc_tmp*.mat; do
+    new_fn=$(basename ${xfm_file/dwi_merged-ecc_tmp/frame_})               # rename matrix files to format expected by mcmats2csv
+    /bin/mv ${xfm_file} ${prep_dir}/dwi_ecc.xfms/${new_fn%.mat}.xfm
+done
+mcmats2csv ${prep_dir}/dwi_ecc.xfms
+/bin/rm -r mat.list ${prep_dir}/dwi_ecc.xfms
+printf "Done (bvecs).\n\n"
+
+
+# Extract all b=0 (T2w) images and merge/average them to get a registration target
+# Also extract all diffusion images and merge them to get an afni diffusion dataset
+echo "Creating merged T2w EPI image..."
+fslsplit ${prep_dir}/dwi_merged-ecc ${prep_dir}/dwi_merged-ecc-vol -t     # faster than using fslroi
+k=0
+for bval in $(cat ${prep_dir}/dwi_merged.bval); do
+    zpk=$(printf '%04d' $k)     # zero-padded integer
+    if [[ $bval -eq 0 ]]; then
+        $FSLDIR/bin/immv ${prep_dir}/dwi_merged-ecc-vol${zpk} ${prep_dir}/dwi_merged-ecc-t2vol${zpk}
+    elif [[ $bval -ne 0 ]] && [[ $run_afni == True ]]; then
+        $FSLDIR/bin/immv ${prep_dir}/dwi_merged-ecc-vol${zpk} ${prep_dir}/dwi_merged-ecc-dwvol${zpk}
+    fi
+    ((k=k+1))
+done
+fslmerge -t ${prep_dir}/t2w_epi_merged ${prep_dir}/dwi_merged-ecc-t2vol*
+fslmaths ${prep_dir}/t2w_epi_merged -Tmean ${prep_dir}/t2w_epi_mean
+[[ $run_afni == True ]] && \
+    fslmerge -t ${prep_dir}/dwi_meant2_merged ${prep_dir}/t2w_epi_mean ${prep_dir}/dwi_merged-ecc-dwvol*
+for im in ${prep_dir}/t2w_epi_merged ${prep_dir}/dwi_merged-ecc-t2vol* ${prep_dir}/dwi_merged-ecc-dwvol* ${prep_dir}/dwi_merged-ecc-vol*; do
+    $FSLDIR/bin/imrm $im
+done
+printf "Done (T2w image).\n\n"
+
+# DTI Brain Extraction (f=0.1 gives generous mask)
+echo "Brain Extraction on T2w EPI..."
+bet ${prep_dir}/t2w_epi_mean ${prep_dir}/t2w_epi_mean-brain -f 0.1 -m
+printf "Done (BET).\n\n"
+
+
+# Fitting diffusion tensors (note: probabilistic tractography depends only on output of bedpostx, not dtifit)
+#   Note output units of FSL for diffusivity are mm^2/s
+#   Note2 --wls option seems to make the most difference in areas with poor quality data, not much difference elsewhere
+echo "Fitting diffusion tensors with dtifit..."
+dtifit --sse --wls --save_tensor --data=${prep_dir}/dwi_merged-ecc --out=${prep_dir}/dti-fsl --mask=${prep_dir}/t2w_epi_mean-brain_mask --bvecs=${prep_dir}/dwi_merged.bvec --bvals=${prep_dir}/dwi_merged.bval
+printf "Done (dtifit).\n\n"
+
+
+# Fit with AFNI
+if [[ $run_afni == True ]]; then
+    echo "Fitting diffusion tensors with 3dDWItoDT..."
+    bvectrans -i ${prep_dir}/dwi_merged-eccrot.bvec      # Create bvec file suitable for afni (dwi_merged-eccrot-nx3.bvec)
+
+    3dDWItoDT -prefix ${prep_dir}/dti-afni.nii.gz -mask ${prep_dir}/t2w_epi_mean-brain_mask.nii.gz -eigs -sep_dsets ${prep_dir}/dwi_merged-eccrot-nx3.bvec ${prep_dir}/dwi_meant2_merged.nii.gz
+
+    # Note on diffusivity units from AFNI and FSL:
+    #   http://dti-tk.sourceforge.net/pmwiki/pmwiki.php?n=Documentation.Diffusivity
+    printf "Done (3dDWItoDT).\n\n"
+fi
+
+if [[ -n ${anat:-} ]]; then
+    # Register anatomical to diffusion space (for underlays)
+    # N.B. FSL's FDT gui produces reg of:
+    #   diff <-lin_6dof-> struct <-lin_12dof/nonlin-> standard (MNI152_T1_2mm_brain)
+    # the struct <-> standard is taken care of in process_anat
+    # I use linear 12 dof for diff <-> struct below
+    # Using normmi instead of mutual info based on Plium et al. 2003
+    echo "Registering anatomical to diffusion space..."
+    flirt -in ${prep_dir}/t2w_epi_mean-brain -ref $anat -dof 12 -cost normmi -omat ${prep_dir}/t2w_epi-to-t1_anat.xfm
+    convert_xfm -omat ${prep_dir}/t1_anat-to-t2w_epi.xfm -inverse ${prep_dir}/t2w_epi-to-t1_anat.xfm
+    flirt -in $anat -ref ${prep_dir}/t2w_epi_mean-brain -applyxfm -init ${prep_dir}/t1_anat-to-t2w_epi.xfm -out ${prep_dir}/t1_anat-diff_space
+    #flirt -in t1_anatomical-256.anat/T1_fast_pveseg.nii.gz -ref ${prep_dir}/t2w_epi_mean-brain -interp nearestneighbour -applyxfm -init ${prep_dir}/t1_anat-to-t2w_epi.xfm -out ${prep_dir}/t1_anat_pveseg-diff_space
+    printf "Done (Registration).\n\n"
+fi
+
+if [[ $norm_fmrib58 == True ]]; then
+    # Normalize to FMRIB58 average 1mm isotropic FA map (copied from average_dti)
+    #   consider whether this is an approprite atlas.  Maybe see: 10.1016/j.neuroimage.2012.01.024
+    #   FMRIB58 FA atlas:  58 healthy male and female subjects aged between 20-50
+    #                      DTI resolution was approximately 2x2x2mm (resampled to 1x1x1 in MNI space)
+    #                      final mean FA image scaled by 10000 from original theo. range of 0:1
+    #   FMRIB58_FA-skeleton_1mm image: derived from FMRIB58_FA_1mm by TBSS skeletonisation, followed
+    #                                  by thresholding at 2000 (i.e., FA=0.2)
+    #   looks good, see: Keihaninejad 2012 (doi:10.1371/journal.pone.0045996)
+    #   they refer to this method as "standard" for TBSS
+    echo "Normalizing to FMRIB58_FA_1mm..."
+    /bin/mkdir -p ${prep_dir}/fmrib58-space-images
+    fslmaths ${prep_dir}/dti-fsl_FA -kernel box 7.5 -ero ${prep_dir}/fmrib58-space-images/dti-fsl_FA_ero
+    flirt -in ${prep_dir}/fmrib58-space-images/dti-fsl_FA_ero -ref ${FSLDIR}/data/standard/FMRIB58_FA_1mm -dof 12 -interp spline -omat ${prep_dir}/fmrib58-space-images/dti-fsl_FA_ero_to_fmrib58_FA_1mm_linear.xfm -out ${prep_dir}/fmrib58-space-images/dti-fsl_FA_ero-fmrib58_space_linear
+    # fnirt --ref=${FSLDIR}/data/standard/FMRIB58_FA_1mm --in=${prep_dir}/dti-fsl_FA_ero --iout=${prep_dir}/dti-fsl_FA_ero-fmrib58_space_nonlinear --aff=${prep_dir}/dti-fsl_FA_ero_to_fmrib58_FA_1mm_linear.xfm --cout=${prep_dir}/dti-fsl_FA_ero_to_fmrib58_FA_1mm_nonlinear_cout_warpfields --config=${FSLDIR}/src/fnirt/fnirtcnf/FA_2_FMRIB58_1mm.cnf --logout=${prep_dir}/dti-fsl_FA_ero_to_fmrib58_FA_1mm_nonlinear.log
+    fnirt --ref=${FSLDIR}/data/standard/FMRIB58_FA_1mm --in=${prep_dir}/fmrib58-space-images/dti-fsl_FA_ero --iout=${prep_dir}/fmrib58-space-images/dti-fsl_FA_ero-fmrib58_space_nonlinear --aff=${prep_dir}/fmrib58-space-images/dti-fsl_FA_ero_to_fmrib58_FA_1mm_linear.xfm --cout=${prep_dir}/fmrib58-space-images/dti-fsl_FA_ero_to_fmrib58_FA_1mm_nonlinear_cout_warpfields --config=FA_2_FMRIB58_1mm.cnf --logout=${prep_dir}/fmrib58-space-images/dti-fsl_FA_ero_to_fmrib58_FA_1mm_nonlinear.log
+    invwarp -w ${prep_dir}/fmrib58-space-images/dti-fsl_FA_ero_to_fmrib58_FA_1mm_nonlinear_cout_warpfields -o ${prep_dir}/fmrib58-space-images/fmrib58_FA_1mm_to_dti-fsl_FA_ero_nonlinear_cout_warpfields -r ${prep_dir}/fmrib58-space-images/dti-fsl_FA_ero
+    applywarp -i ${FSLDIR}/data/standard/FMRIB58_FA_1mm -r ${prep_dir}/fmrib58-space-images/dti-fsl_FA_ero -w ${prep_dir}/fmrib58-space-images/fmrib58_FA_1mm_to_dti-fsl_FA_ero_nonlinear_cout_warpfields -o ${prep_dir}/fmrib58-space-images/fmrib58_FA_1mm-diff_space_nonlinear
+    printf "Done (Normalization).\n\n"
+fi
+
+# Generate quick fibre tracts with Diffusion Toolkit and AFNI
+if [[ $run_dtk == True ]]; then
+    # n.b. NIfTI dictates the tensor in order (xx, yx, yy, zx, zy, zz) (i.e. lower)
+    # FSL outputs the tensor in order (xx, xy, xz, yy, yz, zz) (i.e. upper)
+    # see http://groups.google.com/group/dtitk/web/Interoperability+with+major+DTI+tools
+    fslsplit ${prep_dir}/dti-fsl_tensor ${prep_dir}/dti-fsl_DD -t
+    /bin/mv -i ${prep_dir}/dti-fsl_tensor.nii.gz ${prep_dir}/dti-fsl_tensor-upper.nii.gz
+    fslmerge -t ${prep_dir}/dti-fsl_tensor-lower ${prep_dir}/dti-fsl_DD0000 ${prep_dir}/dti-fsl_DD0001 ${prep_dir}/dti-fsl_DD0003 ${prep_dir}/dti-fsl_DD0002 ${prep_dir}/dti-fsl_DD0004 ${prep_dir}/dti-fsl_DD0005
+    /bin/rm ${prep_dir}/dti-fsl_DD*
+    ln -s ./dti-fsl_tensor-lower.nii.gz ${prep_dir}/dti-fsl_tensor.nii.gz  # required naming scheme for dti_tracker
+
+    echo "Generating FSL fibre tracks..."
+    angleThresh=60  # Soares says 40-70, have seen 60 used elsewhere...
+    dti_tracker ${prep_dir}/dti-fsl ${prep_dir}/dti-fsl-tract_${angleThresh}deg.trk -it nii.gz -at $angleThresh -m ${prep_dir}/t2w_epi_mean-brain_mask.nii.gz
+    spline_filter ${prep_dir}/dti-fsl-tract_${angleThresh}deg.trk 0.5 ${prep_dir}/dti-fsl-tract_${angleThresh}deg-splinefilt.trk
+    printf "Done (FSL fibres).\n\n"
+fi
+if [[ $run_afni == True ]]; then
+    echo "Generating AFNI fibre tracks (3dTrackID deterministic)..."
+    3dTrackID -mode DET -dti_in ${prep_dir}/dti-afni -netrois ${prep_dir}/t2w_epi_mean-brain_mask.nii.gz -mask ${prep_dir}/t2w_epi_mean-brain_mask.nii.gz -logic OR -write_opts -do_trk_out -nifti -prefix ${prep_dir}/dti-afni-trackid_det \
+      || { es=$?; [[ $es == 1 ]] && true || echo "3dTrackID exited with error code ${es}..."; }  # 3dTrackID seems to exit with 1 afer a successful run -- why?  Author says it was a bug, now fixed.
+    #  n.b. 3dTrackID has more stringent thresholds than dti_tracker, it seems:
+    #  FA=0.2, angle=60deg, length=20mm, no. seeds in x/y/z=2/2/2
+    printf "Done (AFNI fibres).\n\n"
+fi
+
+# Next would run QC stats generation: dti_qc
+exit 0

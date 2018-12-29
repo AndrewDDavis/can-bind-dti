@@ -1,0 +1,90 @@
+#!/bin/bash
+
+# Move preprocessed images to standard space using the transforms created during dti_preprocess
+# Run this from an exam directory with a dti_preprocessed dir in it
+
+# v0.1 (Oct 2017) by Andrew Davis (addavis@gmail.com)
+
+# Apply masks in std space to remove tiny background signals
+
+# Check for expected files
+prep_dir=dti_preprocessed
+[[ -d "${prep_dir}" ]] || { echo "Error: prep_dir (${prep_dir}) not found in ${PWD}."; exit 2; }
+[[ $(imtest dti_preprocessed/dti-fsl_FA) == 1 ]] || { echo "Error: image not found in ${PWD}: dti_preprocessed/dti-fsl_FA"; exit 2; }
+fnirt_config_file="${HOME}"/Documents/CAN-BIND/CAN-BIND_DTI/bin/FA_2_JHU_2mm.cnf
+[[ -e "${fnirt_config_file}" ]] || { echo "Error: fnirt config file not found: ${fnirt_config_file}"; exit 2; }
+
+# Make output dir and apply warps as necessary
+jhu_dir=dti_preprocessed/jhu-space
+jhu_reg_dir=dti_preprocessed/jhu-space/reg
+mkdir -p ${jhu_reg_dir}
+
+# Create warp files to apply using FA data
+echo "Creating JHU warps..."
+jhu_atlas="${FSLDIR}/data/atlases/JHU/JHU-ICBM-FA-2mm"
+fslmaths ${prep_dir}/dti-fsl_FA -kernel box 7.5 -ero ${jhu_dir}/dti-fsl_FA_ero
+flirt -in ${jhu_dir}/dti-fsl_FA_ero \
+      -ref "${jhu_atlas}" \
+      -dof 12 \
+      -interp spline \
+      -omat "${jhu_reg_dir}"/dti-fsl_FA_ero_to_JHU_FA_2mm_linear.xfm \
+      -out "${jhu_reg_dir}"/dti-fsl_FA_ero-jhu_space_linear
+fnirt --ref="${jhu_atlas}" \
+      --in=${jhu_dir}/dti-fsl_FA_ero \
+      --iout="${jhu_reg_dir}"/dti-fsl_FA_ero-jhu_space_nonlinear \
+      --aff="${jhu_reg_dir}"/dti-fsl_FA_ero_to_JHU_FA_2mm_linear.xfm \
+      --cout="${jhu_reg_dir}"/dti-fsl_FA_ero_to_JHU_FA_2mm_nonlinear_cout_warpfields \
+      --config="${fnirt_config_file}" \
+      --logout="${jhu_reg_dir}"/dti-fsl_FA_ero_to_JHU_FA_2mm_nonlinear.log
+invwarp -w "${jhu_reg_dir}"/dti-fsl_FA_ero_to_JHU_FA_2mm_nonlinear_cout_warpfields \
+        -o "${jhu_reg_dir}"/JHU_FA_2mm_to_dti-fsl_FA_ero_nonlinear_cout_warpfields \
+        -r ${jhu_dir}/dti-fsl_FA_ero
+applywarp -i "${jhu_atlas}" \
+          -r ${jhu_dir}/dti-fsl_FA_ero \
+          -w "${jhu_reg_dir}"/JHU_FA_2mm_to_dti-fsl_FA_ero_nonlinear_cout_warpfields \
+          -o "${jhu_reg_dir}"/JHU_FA_2mm-diff_space_nonlinear
+
+function aw {
+    in_img="$1"
+    in_img_pref="$(basename "$in_img")"
+    if [[ -n "$2" ]]; then
+        intrpm="$2"
+    else
+        intrpm=spline   # default for me -- FSL default is trilinear!
+    fi
+    # echo "  ${in_img} w/ ${intrpm}..."
+    [[ $(${FSLDIR}/bin/imtest "${prep_dir}"/"${in_img}") == 1 ]] || { echo "Error: ${prep_dir}/${in_img} not found in ${PWD}."; exit 2; }
+    applywarp -i "${prep_dir}"/"${in_img}" \
+              -r "${jhu_atlas}" \
+              -w "${jhu_reg_dir}"/dti-fsl_FA_ero_to_JHU_FA_2mm_nonlinear_cout_warpfields \
+              --interp="${intrpm}" \
+              -o "${jhu_dir}"/"${in_img_pref}"-jhusp
+}
+
+echo "Applying warps..."
+for i in dti-fsl_FA dti-fsl_L1 dti-fsl_MD dti-fsl_RD dti-fsl_sse \
+         dti-afni_FA dti-afni_L1 dti-afni_MD dti-afni_RD; do
+    aw "$i"
+done
+
+# Also apply warp to mask using nearest neighbour interp
+mkdir -p "${prep_dir}"/qc
+if [[ ! -e "${prep_dir}"/qc/t2w_epi_mean-brain_mask-ero.nii.gz ]]; then
+    erode_mask "${prep_dir}"/t2w_epi_mean-brain_mask.nii.gz 7.5 2
+    /bin/mv "${prep_dir}"/t2w_epi_mean-brain_mask-ero.nii.gz "${prep_dir}"/qc
+fi
+for i in t2w_epi_mean-brain_mask qc/t2w_epi_mean-brain_mask-ero; do
+    aw "$i" nn
+done
+
+# clean up mask edges
+for i in t2w_epi_mean-brain_mask t2w_epi_mean-brain_mask-ero; do
+    fslmaths "${jhu_dir}"/"${i}"-jhusp -kernel box 7.5 -ero -dilD "${jhu_dir}"/"${i}"-jhusp
+done
+
+# apply mask to std space images to save space
+echo "Applying mask..."
+for i in dti-fsl_FA dti-fsl_L1 dti-fsl_MD dti-fsl_RD dti-fsl_sse \
+         dti-afni_FA dti-afni_L1 dti-afni_MD dti-afni_RD; do
+    fslmaths "${jhu_dir}"/"$i"-jhusp -mul "${jhu_dir}"/t2w_epi_mean-brain_mask-jhusp "${jhu_dir}"/"$i"-jhusp
+done

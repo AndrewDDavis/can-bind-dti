@@ -1,0 +1,245 @@
+#!/bin/bash
+
+# v0.1 (April 2018) by Andrew Davis (addavis@gmail.com)
+
+print_usage () {
+cat << EOF
+
+    $(basename $0)
+    ----------------
+    This script produces skeletonized images (FA, etc). Writes images to
+    <proj-dir>/data/merged_skel_*. Also writes a corresponding visit
+    list file to <proj-dir>/group_results/cohort_csvs/visit_list-v01.txt.
+
+    See "DTI ROI analysis notes".
+
+    Usage:
+        $(basename $0) visit_code metric
+
+    Arguments
+    ---------
+      - visit_code: cohort to use; one of {1,12,13,123}
+      - metric: type of data; one of {FA, MD, etc}
+
+EOF
+}
+
+# Robust script options
+set -o nounset    # fail on unset variables
+set -o errexit    # fail on non-zero return values
+set -o pipefail   # fail if any piped command fails
+
+# Red error messages, etc
+[[ -f ~/.bash_script_messages ]] \
+  && source ~/.bash_script_messages \
+  || scriptEcho() { shift $(($#-1)); echo "$1"; }
+
+
+# Defaults
+proj_dir=~/Documents/Research_Projects/CAN-BIND_DTI
+rois_dir=${proj_dir}/data/ROIs
+cingroi=${rois_dir}/LowerCingulum_2mm
+[[ $(imtest $cingroi) -eq 1 ]] || { scriptEcho -e "file not found: $cingroi"; exit 2; }
+# ^^ The LowerCingulum_1mm has no s/qform, so I just used flirt with applyisoxfm
+#    to transform to 2mm. The mask is meant to pick out the cingulum bundle and
+#    skeletonize properly.
+gr_res_dir=${proj_dir}/group_results
+
+# Arguments
+[[ $# -eq 0 ]] && { print_usage; exit 1; }
+[[ $# -eq 2 ]] || { scriptEcho -e "expected 2 args."; exit 2; }
+
+vis_code=$1 && shift
+[[ $vis_code == 1 || $vis_code == 12 || $vis_code == 13 || $vis_code == 123 ]] \
+  || { scriptEcho -e "unrecognized visit code: $vis_code"; exit 2; }
+
+metric=$1 && shift
+
+
+# Subprojects dir exists?
+[[ -d ${proj_dir}/data/subprojects ]] || { echo "dir not found: ${proj_dir}/data/subprojects"; exit 2; } 
+
+
+# Parse visit code
+if [[ $vis_code == 1 ]]; then
+    nameglob=_01
+    subjid_list_file=${gr_res_dir}/cohort_csvs/subjid_list-v01.txt
+    visit_list_file=${gr_res_dir}/cohort_csvs/visit_list-v01.txt
+    skel_dir=${proj_dir}/data/merged_skel_v01
+elif [[ $vis_code == 12 ]]; then
+    nameglob=_0[12]
+elif [[ $vis_code == 13 ]]; then
+    nameglob=_0[13]
+elif [[ $vis_code == 123 ]]; then
+    nameglob=_0[123]
+    subjid_list_file=${gr_res_dir}/cohort_csvs/subjid_list-v01v02v03.txt
+    visit_list_file=${gr_res_dir}/cohort_csvs/visit_list-v01v02v03.txt
+    skel_dir=${proj_dir}/data/merged_skel_v01v02v03
+fi
+
+# Check for sensible values
+[[ -f "$subjid_list_file" ]] || { scriptEcho -e "file not found: $subjid_list_file"; exit 2; }
+if [[ $metric == FA ]] && [[ -d $skel_dir ]]; then
+    scriptEcho -e "dir exists: $skel_dir"
+    exit 2
+elif [[ ! $metric == FA ]] && [[ ! -d $skel_dir ]]; then
+    scriptEcho -e "dir not found: $skel_dir"
+    exit 2
+elif [[ $metric == FA ]]; then
+    mkdir $skel_dir
+fi
+
+
+# Get list of subjids to work with and create proper file paths
+# N.B. used to do:
+#   fa_niis=($(find subprojects -path '*/*/*_01/dti_preprocessed/jhu-space/dti-fsl_FA-jhusp.nii.gz' | sort))
+subjid_list=($(cat "$subjid_list_file"))
+scriptEcho "Parsing ${#subjid_list[@]} subjids ..."
+
+subj_dirs=()
+for s in ${subjid_list[@]}; do
+    d=($(find ${proj_dir}/data/subprojects -maxdepth 2 -name "${s}${nameglob}" -print | sort)) # e.g. /.../subprojects/CTT_A/CAM_0002_01
+    subj_dirs+=(${d[@]})
+done
+# print actual visit codes in the order of merging for later retrieval
+printf '%s\n' "${subj_dirs[@]#*/data/subprojects/*/}" > $visit_list_file
+
+subj_niis=()
+for d in ${subj_dirs[@]}; do
+    f="${d}/dti_preprocessed/jhu-space/dti-fsl_${metric}-jhusp.nii.gz"
+    [[ -e "$f" ]] || { scriptEcho -e "file not found: $f"; exit 2; }
+    subj_niis+=("$f")
+done
+
+
+# Check for correct number of files
+n_ids=$(wc -l "$subjid_list_file" | cut -d ' ' -f 1)
+n_files_expected=$((n_ids*${#vis_code}))
+n_files=${#subj_niis[@]}
+[[ $n_files -eq $n_files_expected ]] || { scriptEcho -e "expected $n_files_expected files"; exit 2; }
+
+
+# Merge all standard space images into single 4D image
+#   n=304 for v01, n=702 for v01v02v03, n=808 for all data available
+scriptEcho "Merging ${#subj_niis[@]} $metric niis into ${skel_dir}/ ..."
+fslmerge -t ${skel_dir}/all_$metric "${subj_niis[@]}"
+cd $skel_dir
+
+if [[ $metric == FA ]]; then
+    scriptEcho "Creating FA skeleton ..."
+    # create mask and mean FA
+    fslmaths all_FA \
+             -max 0 -Tmin -bin \
+             mean_FA_mask \
+             -odt char
+    
+    fslmaths all_FA \
+             -mas mean_FA_mask \
+             all_FA
+    
+    fslmaths all_FA \
+             -Tmean \
+             mean_FA
+
+    # create skeleton (skeletonising mean FA)
+    tbss_skeleton -i mean_FA -o mean_FA_skeleton
+
+    # use default 0.2 threshold for skeleton
+    thresh=0.2
+    echo $thresh > thresh.txt
+    
+    fslmaths mean_FA_skeleton \
+             -thr $thresh \
+             -bin mean_FA_skeleton_mask \
+             -odt char
+
+    # create skeleton distance map (for use in projection search)
+    fslmaths mean_FA_mask \
+             -mul -1 \
+             -add 1 \
+             -add mean_FA_skeleton_mask \
+             mean_FA_skeleton_mask_dst
+    
+    distancemap -i mean_FA_skeleton_mask_dst \
+                -o mean_FA_skeleton_mask_dst
+
+    # project all FA data onto skeleton
+    tbss_skeleton -i mean_FA \
+                  -p $thresh \
+                  mean_FA_skeleton_mask_dst \
+                  $cingroi \
+                  all_FA \
+                  all_FA_skeletonised
+
+
+    # Now generate a mask of the skeleton periphery (i.e excluding JHU ROIs)
+    imcp mean_FA_skeleton_mask mean_FA_skelperiphery_mask
+    for r in ${rois_dir}/40_ROIs/ROI-[0-9][0-9].nii.gz; do
+        fslmaths mean_FA_skelperiphery_mask \
+                 -sub $r \
+                 mean_FA_skelperiphery_mask
+    done
+    fslmaths mean_FA_skelperiphery_mask \
+             -thr 0.0 -bin \
+             mean_FA_skelperiphery_mask \
+             -odt char
+
+    # Split into hemispheres and fill zeros to original matrix
+    [[ $(fslval mean_FA_skelperiphery_mask dim1) -eq 91 ]] \
+      || { echo "mean_FA_skelperiphery_mask not of expected size"; exit 2; }
+    fslroi mean_FA_skelperiphery_mask \
+           mean_FA_skelperiphery_R \
+           0 45 0 -1 0 -1
+    fslroi mean_FA_skelperiphery_mask \
+           mean_FA_skelperiphery_L \
+           45 -1 0 -1 0 -1
+
+    flirt -in mean_FA_skelperiphery_R \
+          -ref mean_FA_skelperiphery_mask \
+          -applyxfm -usesqform \
+          -out mean_FA_skelperiphery_R \
+          -datatype char
+    flirt -in mean_FA_skelperiphery_L \
+          -ref mean_FA_skelperiphery_mask \
+          -applyxfm -usesqform \
+          -out mean_FA_skelperiphery_L \
+          -datatype char
+
+    # consider cleaning this up with:
+    #   fslmaths -roi <xmin> <xsize> <ymin> <ysize> <zmin> <zsize> <tmin> <tsize>
+    # possibly also split into inferior superior at z=34...
+
+else
+    # This method to use non-FA images in TBSS follows the 
+    #   [user guide](https://fsl.fmrib.ox.ac.uk/fsl/fslwiki/TBSS/UserGuide)
+    # N.B. used to do:
+    #   pt_niis=($(find ../subprojects -path "../subprojects/*/*_01/*/*/dti-fsl_${pt}-jhusp.nii.gz" | sort))
+    scriptEcho "Projecting all_$metric onto skeleton ..."
+    [[ $(imtest mean_FA_mask) -eq 1 ]] || { scriptEcho -e "file not found: mean_FA_mask"; exit 2; }
+    fslmaths all_$metric \
+             -mas mean_FA_mask \
+             all_$metric
+
+    [[ -e thresh.txt ]] || { scriptEcho -e "file not found: thresh.txt"; exit 2; }
+    [[ $(imtest mean_FA) -eq 1 ]] || { scriptEcho -e "file not found: mean_FA"; exit 2; }
+    [[ $(imtest mean_FA_skeleton_mask_dst) -eq 1 ]] || { scriptEcho -e "file not found: mean_FA_skeleton_mask_dst"; exit 2; }
+    [[ $(imtest all_FA) -eq 1 ]] || { scriptEcho -e "file not found: all_FA"; exit 2; }
+
+    if [[ $metric == MD || $metric == L1 || $metric == RD ]]; then
+        scriptEcho "Multiplying all_$metric by 1000 to increase precision in later tools (fslstats)"
+        fslmaths all_$metric \
+                 -mul 1000 \
+                 all_$metric
+    else
+        scriptEcho -w "Consider whether multiplying by 1000 is appropriate for this data."
+    fi
+
+    thresh=$(cat thresh.txt)
+    tbss_skeleton -i mean_FA \
+                  -p $thresh \
+                  mean_FA_skeleton_mask_dst \
+                  $cingroi \
+                  all_FA \
+                  all_${metric}_skeletonised \
+                  -a all_${metric}
+fi

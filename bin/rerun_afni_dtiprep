@@ -1,0 +1,42 @@
+#!/bin/bash
+
+# Re-run the afni side of dti_preprocess
+# this was done to generate RD files for Sondos
+# 
+# Run this with an argument: file containing a list of directories (absolute paths) that
+#   contain old dti-afni_FA.nii.gz (etc.) files that you want to replace. E.g., the output
+#   of `mdfind -onlyin . -name dti_preprocessed`.
+#
+# Makes "oldafni/" directories in dti_preprocessed which need to be cleaned up manually.
+#   e.g. `find -name oldafni -type d -exec rm -r '{}' \;`
+#
+# Also run dti_qc afterwards if desired
+
+# v0.1 (Sept 2017) by Andrew Davis (addavis@gmail.com)
+
+[[ $# -eq 1 ]] || { echo "error: no file specified"; exit 2; }
+
+list_file="$1"
+[[ -f "$list_file" ]] || { echo "error: list file not found: ${list_file}"; exit 2; }
+
+# Check for AFNI
+if ! which 3dDWItoDT > /dev/null; then
+    echo "Error: AFNI (3dDWItoDT) not found on path."
+    exit 2
+fi
+
+while IFS='' read -r f || [[ -n "$f" ]]; do
+    echo "Processing $f"
+
+    [[ -d "$f" ]] \
+        && cd "$f" \
+        || { echo "dir not found: $f"; exit 2; }
+
+    # move old files
+    mkdir oldafni || break
+    mv dti-afni* oldafni/ || break
+
+    # re-run afni
+    3dDWItoDT -prefix dti-afni.nii.gz -mask t2w_epi_mean-brain_mask.nii.gz -eigs -sep_dsets dwi_merged-eccrot-nx3.bvec dwi_meant2_merged.nii.gz || break
+    3dTrackID -mode DET -dti_in dti-afni -netrois t2w_epi_mean-brain_mask.nii.gz -mask t2w_epi_mean-brain_mask.nii.gz -logic OR -write_opts -do_trk_out -nifti -prefix dti-afni-trackid_det || break
+done < "$list_file"

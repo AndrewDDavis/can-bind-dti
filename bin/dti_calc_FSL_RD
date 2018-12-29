@@ -1,0 +1,14 @@
+#!/bin/bash
+
+# Calculate RD from FSL values created with dti_preprocess
+# Run this from an exam directory with a dti_preprocessed dir in it
+
+# v0.1 (Oct 2017) by Andrew Davis (addavis@gmail.com)
+
+# Check for expected files
+prep_dir=dti_preprocessed
+[[ -d "${prep_dir}" ]] || { echo "Error: prep_dir (${prep_dir}) not found in ${PWD}."; exit 2; }
+[[ $($FSLDIR/bin/imtest "${prep_dir}/dti-fsl_L1") == 1 ]] || { echo "Error: ${prep_dir}/dti-fsl_L1 not found in ${PWD}."; exit 2; }
+
+# Calculate RD from L2 and L3
+fslmaths ${prep_dir}/dti-fsl_L2 -add ${prep_dir}/dti-fsl_L3 -div 2 ${prep_dir}/dti-fsl_RD 

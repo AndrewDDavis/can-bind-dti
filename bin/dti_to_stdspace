@@ -1,0 +1,48 @@
+#!/bin/bash
+
+# Move preprocessed images to standard space using the transforms created during dti_preprocess
+# Run this from an exam directory with a dti_preprocessed dir in it
+
+# v0.1 (Oct 2017) by Andrew Davis (addavis@gmail.com)
+
+# decide on interpolation: use spline per FSL mailing list
+# add the bigger mask
+
+# Check for expected files
+prep_dir=dti_preprocessed
+[[ -d "${prep_dir}" ]] || { echo "Error: prep_dir (${prep_dir}) not found in ${PWD}."; exit 2; }
+
+# Make output dir and apply warps as necessary
+mkdir -p "${prep_dir}"/fmrib58-space-images
+
+function aw {
+    in_img="$1"
+    in_img_pref="$(basename "$in_img")"
+    if [[ -n "$2" ]]; then
+        intrpm="$2"
+    else
+        intrpm=spline   # default for me -- FSL default is trilinear!
+    fi
+    # echo "  ${in_img} w/ ${intrpm}..."
+    [[ $(${FSLDIR}/bin/imtest "${prep_dir}"/"${in_img}") == 1 ]] || { echo "Error: ${prep_dir}/${in_img} not found in ${PWD}."; exit 2; }
+    applywarp -i "${prep_dir}"/"${in_img}" \
+              -r "${FSLDIR}"/data/standard/FMRIB58_FA_1mm \
+              -w "${prep_dir}"/fmrib58-space-images/dti-fsl_FA_ero_to_fmrib58_FA_1mm_nonlinear_cout_warpfields \
+              --interp="${intrpm}" \
+              -o "${prep_dir}"/fmrib58-space-images/"${in_img_pref}"-stdsp
+}
+
+for i in dti-fsl_FA dti-fsl_L1 dti-fsl_MD dti-fsl_RD dti-fsl_sse \
+         dti-afni_FA dti-afni_L1 dti-afni_MD dti-afni_RD; do
+    aw "$i"
+done
+
+# Also apply warp to mask using nearest neighbour interp
+for i in t2w_epi_mean-brain_mask qc/t2w_epi_mean-brain_mask-ero; do
+    aw "$i" nn
+done
+
+# clean up mask edges
+for i in t2w_epi_mean-brain_mask t2w_epi_mean-brain_mask-ero; do
+    fslmaths "${prep_dir}"/fmrib58-space-images/"${i}"-stdsp -kernel box 7.5 -ero -dilD "${prep_dir}"/fmrib58-space-images/"${i}"-stdsp
+done

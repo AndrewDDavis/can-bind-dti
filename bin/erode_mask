@@ -1,0 +1,64 @@
+#!/bin/bash
+
+# v0.1 (Mar 2018) by Andrew Davis (addavis@gmail.com)
+
+# Erodes a nifti mask image using fslmaths, making sure to
+#   keep a consistent kernel and erode the top and bottom slices as well.
+
+# Options:
+#   sz -- kernel size in mm (isotropic)
+#    n -- number of times to erode mask
+
+# Usage: erode_mask mask.nii sz n
+# Example: erode_mask brain_mask.nii 7.5 2
+# Output: mask with datatype char and named as input-ero
+
+[[ $# -eq 3 ]] || { echo "expected 3 args."; exit 2; }
+
+in_mask="$1"
+sz="$2"
+n="$3"
+
+# sort out filenames that may not have an extension, but must be nii or nii.gz files
+in_dir="$(dirname "$in_mask")"
+in_bn="$(basename "$in_mask")"
+in_bn_pref="$(remove_ext "$in_bn")"
+in_path="$(find "$in_dir" -name "${in_bn_pref}.nii*" -print)"
+in_pref="$(remove_ext "$in_path")"
+in_ext="${in_path/$in_pref/}"
+[[ -e "${in_pref}${in_ext}" ]] || { echo "file not found: ${in_pref}${in_ext}"; exit 2; }
+
+# output extension
+if [[ $FSLOUTPUTTYPE == NIFTI_GZ ]]; then
+    out_ext=nii.gz
+elif [[ $FSLOUTPUTTYPE == NIFTI ]]; then
+    out_ext=nii
+else
+    echo "unknown FSLOUTPUTTYPE"
+    exit 2
+fi
+
+# how many slices
+slice_cnt=$(fslval "$in_pref" dim3)
+last_slice=$(printf "%04d" $((slice_cnt - 1)))
+
+# one erosion, then split to make sure top and bottom slices get zeroed out
+fslmaths "$in_pref" -bin -kernel box $sz -ero "${in_pref}-ero" -odt char
+fslsplit "${in_pref}-ero" "${in_pref}-ero-sl_" -z
+/bin/rm "${in_pref}-ero.${out_ext}"
+
+fslmaths "${in_pref}-ero-sl_0000" -mul 0 "${in_pref}-ero-sl_0000" -odt char
+fslmaths "${in_pref}-ero-sl_${last_slice}" -mul 0 "${in_pref}-ero-sl_${last_slice}" -odt char
+
+fslmerge -z "${in_pref}-ero" "${in_pref}"-ero-sl_*.${out_ext}
+/bin/rm "${in_pref}"-ero-sl_*.${out_ext}
+
+# ensure the required number of erosions happen
+ero_cnt=1
+while [[ $ero_cnt -lt $n ]]; do
+    fslmaths "${in_pref}-ero" -kernel box $sz -ero "${in_pref}-ero" -odt char
+    ((ero_cnt++))
+done
+
+# outfile="${in_pref}"-ero1.${out_ext}
+# /bin/mv -i "${outfile}" "${outfile/ero1/ero}"

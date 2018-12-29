@@ -1,0 +1,273 @@
+#!/bin/bash
+
+# Preprocess DTI data from CAN-BIND and Walter's data set: probabilistic tracking preparation
+# See print_usage below for syntax info
+
+# v0.2 (Mar 2015) by Andrew Davis (addavis@gmail.com)
+
+# For a good review of practical DTI processing considerations see:
+# Soares JM, Marques P, Alves V, Sousa N. A hitchhiker’s guide to diffusion tensor imaging. Frontiers in Neuroscience. 2013;7:31. doi:10.3389/fnins.2013.00031.
+
+# For a guide to FSL's diffusion (FDT) tools, see:
+#   http://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FDT/UserGuide
+# For useful practica, see:
+#   FDT & TBSS: http://fsl.fmrib.ox.ac.uk/fslcourse/lectures/practicals/fdt1/
+#   Tractography: http://fsl.fmrib.ox.ac.uk/fslcourse/lectures/practicals/fdt2/
+
+# Order of operations from the FSL User Guide:
+#   http://fsl.fmrib.ox.ac.uk/fsl/fslwiki/FDT/UserGuide#Processing_pipeline
+# 1. study or scanner-specific pre-processing
+# 2. Eddy current correction
+# 3. Brain extraction
+# 4. Fitting of diffusion tensors on corrected data (dtifit)
+# 5. Fitting of the probabilistic diffusion model (bedpostx)
+# 6. Registration
+# 7. Probabilistic tractography (probtrackx)
+# 8. Further post-processing of probtrackx outputs
+#
+# This script can do #5.
+
+
+# Robust scriptng options
+set -o nounset
+set -o errexit
+set -o pipefail
+shopt -s nullglob
+
+print_usage () {
+cat << EOF
+
+   $(basename $0)
+   --------------
+   This script runs bedpostx and 3dDWUncert to prepare for probabilistic tractography.
+   Run the script in an exam directory, after running dti_preprocess.  It expects to
+   find a dti_preprocessed directory that was populated by dti_preprocess.
+
+   Usage: $(basename $0) [options]
+
+      --noafni : Do not use AFNI (3dDWUncert)
+     --nominip : Do not do mini-probabilistic tracking (with 3dTrackID, creates *large* file)
+       --nobpx : Do not run bedpostx
+    --nobpxchk : Do not check the bedpostx input directory against a truth file
+--allowdiff RE : allow differences in lines matching RE (eg. '\(^dim3\|^pixdim3\)')
+     --sn args : must be last arg: all following arguments are for sqsub on
+                   sharcnet; use submit_bpx_jobs for this.
+
+    Example:
+    cd UBC_0010_01
+    probtrack_prep --nominip
+
+    Setting up the datacheck file:
+    cd UBC_0010_01
+    export PATH=/home/andrew/Documents/CAN-BIND/CAN-BIND_DTI/bin:"\${PATH}"
+    probtrack_prep --noafni --nobpxchk --nominip
+    # then wait a minute for xfibres to start and ^C
+    mv dti_preprocessed/bedpostx_datacheck.log ../
+    rm -r dti_preprocessed/bedpostx_input* dti_preprocessed/probtrack_prep.log
+
+EOF
+}
+
+# Defaults
+run_afni=True
+run_minip=True
+bpx_chk=True
+run_bpx=True
+logfile="dti_preprocessed/probtrack_prep.log"
+run_as_nice=False
+
+# Parse arguments
+while [ $# -gt 0 ]; do
+   case $1 in
+      --noafni ) run_afni=False;;
+     --nominip ) run_minip=False;;
+       --nobpx ) run_bpx=False;;
+    --nobpxchk ) bpx_chk=False;;
+   --allowdiff ) diff_ignore+=(-I "$2"); shift;;
+          --sn ) shift; sub_args=("$@"); shift $#; break;;
+     -h|--help ) print_usage; exit 0;;
+             * ) echo "unrecognized option '$1'"; exit 2;;
+ #          -* ) echo "unrecognized option '$1'"; print_usage; exit 2;;
+ #           * ) break;;
+   esac
+   shift    # remove argument that has been handled
+done
+
+# FSL availability check -- some tools require that FSLDIR be set in the environment
+if ! which fsl > /dev/null; then
+    echo "Error: FSL not found on path."
+    exit 2
+elif [[ -z ${FSLDIR:-} ]]; then
+    echo "Error: FSLDIR not set."
+    exit 2
+fi
+
+# Check for AFNI
+if [[ $run_afni == "True" ]] && ! which 3dDWUncert > /dev/null; then
+    echo "Warning: AFNI (3dDWUncert) not found on path."
+    echo "       : Disabling 3dDWUncert."
+    run_afni=False
+fi
+
+# Check for expected files
+if ! [[ -d dti_preprocessed ]]; then
+    echo "Error: expected dir in $(basename $PWD): dti_preprocessed"
+    exit 2
+elif ! [[ -e dti_preprocessed/dwi_merged-ecc.nii.gz ]] || ! [[ -e dti_preprocessed/t2w_epi_mean-brain_mask.nii.gz ]]; then
+    echo "Error: in $(basename $PWD), expected files dti_preprocessed/dwi_merged-ecc.nii.gz and dti_preprocessed/t2w_epi_mean-brain_mask.nii.gz"
+    exit 2
+elif [[ $run_afni == True ]] && ! [[ -e dti_preprocessed/dwi_meant2_merged.nii.gz ]]; then
+    echo "Error: in $(basename $PWD), expected file dti_preprocessed/dwi_meant2_merged.nii.gz for afni processing."
+    exit 2
+fi
+if [[ $run_bpx == True ]] && [[ $bpx_chk == True ]] && [[ ! -e ../bedpostx_datacheck.log ]]; then
+    echo "Error: expected files: ../bedpostx_datacheck.log"
+    echo "     : find the file at dti_preprocessed/bedpostx_datacheck.log"
+    echo "     : after running with --noafni --nobpxchk --nominip on a test copy"
+    exit 2
+fi
+
+# Check to make sure it hasn't been run already
+if [[ -e dti_preprocessed/probtrack_prep.log ]]; then
+    if [[ $run_afni == True ]] && [[ -e dti_preprocessed/dti-afni_dwuncert.nii.gz ]]; then
+        echo "AFNI output files present. Aborting..."
+        exit 1
+    elif [[ $run_bpx == True ]] && [[ -d dti_preprocessed/bedpostx_input ]]; then
+        echo "bedpostx_input dir exists. Aborting..."
+        exit 1
+    fi
+fi
+
+# Start the main work
+date | tee -a "${logfile}"
+echo "Preparing probabilistic tracking for exam $(basename $PWD)..." | tee -a "${logfile}"
+echo "Running on host: $HOSTNAME" | tee -a "${logfile}"
+printf "Redirecting output to ${logfile}\n\n"
+exec >> "${logfile}"
+exec 2>&1
+set -x
+
+
+# Run afni tools for (mini-)probabilistic tractography
+if [[ $run_afni == True ]]; then
+    if [[ "${sub_args:-}" ]]; then
+        # running on sharcnet cpu
+        sub_args+=(--idfile=sqsub_jobid.txt)
+        sub_args+=(3dDWUncert -inset dti_preprocessed/dwi_meant2_merged.nii.gz -input dti_preprocessed/dti-afni -grads dti_preprocessed/dwi_merged-eccrot-nx3.bvec -mask dti_preprocessed/t2w_epi_mean-brain_mask.nii.gz -prefix dti_preprocessed/dti-afni_dwuncert)
+        # echo "in dir: $PWD"
+        # echo "would run sqsub with args:"
+        # echo "  ${sub_args[@]}"
+        sqsub "${sub_args[@]}"
+
+        # set up waiting job on completion
+        sleep 2
+        if [[ -e sqsub_jobid.txt ]]; then
+            jobid=$(cat sqsub_jobid.txt)
+            /bin/rm sqsub_jobid.txt
+            post_sub_args=(-w $jobid -o "${sub_args[1]}" -r 10m -q serial -n 1 --mpp=512M)
+            post_sub_args+=(/bin/bash -c)
+            post_sub_args+=("3dcopy dti_preprocessed/dti-afni_dwuncert+orig dti_preprocessed/dti-afni_dwuncert.nii.gz && /bin/rm dti_preprocessed/dti-afni_dwuncert+orig.{BRIK,HEAD};")
+            # echo "submitting post-job: sqsub ${post_sub_args[@]}"
+            sqsub "${post_sub_args[@]}"
+        else
+            echo "warning: found no sqsub_jobid.txt"
+        fi
+    else
+        3dDWUncert -inset dti_preprocessed/dwi_meant2_merged.nii.gz -input dti_preprocessed/dti-afni -grads dti_preprocessed/dwi_merged-eccrot-nx3.bvec -mask dti_preprocessed/t2w_epi_mean-brain_mask.nii.gz -prefix dti_preprocessed/dti-afni_dwuncert
+        3dcopy dti_preprocessed/dti-afni_dwuncert+orig dti_preprocessed/dti-afni_dwuncert.nii.gz \
+          && /bin/rm dti_preprocessed/dti-afni_dwuncert+orig.{BRIK,HEAD}
+    fi
+
+    if [[ $run_minip == True ]]; then
+        echo "Generating AFNI fibre tracks (3dTrackID mini-probabalistic)..."
+        3dTrackID -mode MINIP -dti_in dti_preprocessed/dti-afni -netrois dti_preprocessed/t2w_epi_mean-brain_mask.nii.gz -mask dti_preprocessed/t2w_epi_mean-brain_mask.nii.gz -logic OR -mini_num 9 -uncert dti_preprocessed/dti-afni_dwuncert.nii.gz -write_opts -do_trk_out -nifti -prefix dti_preprocessed/dti-afni_trackid_minip
+        echo "Done (AFNI mini-p fibres)."
+        echo "Check fibre tracks with:"
+        printf " $ TrackVis dti_preprocessed/dti-afni_trackid_minip_000.trk\n\n"
+        #  n.b. 3dTrackID's mini-probabilistic mode combines "the speed and tract-preserving properties of the deterministic algorithm with the uncertainty inclusion of the probabilistic"
+        #  see Taylor et al., HBM 2014: A DTI-Based Tractography Study of Effects on Brain Structure Associated with Prenatal Alcohol Exposure in Newborns
+        # consider supplying dti_extra for segmentation information here (take the place of an FA map for determining where tracks can propagate)
+        # For discussion of combining fMRI and DTI network analysis, see: http://afni.nimh.nih.gov/pub/dist/edu/latest/afni_handouts/FATCAT.pdf
+    fi
+    echo "Done (afni)."
+fi
+
+# Create bedpostx directory and populate with expected files
+# For a good discussion of crossing fibre techniques, see:
+#   http://www.dailymotion.com/video/xldrc5_a-video-tutorial-on-crossing-fibres_tech#rel-page-under-1
+if [[ $run_bpx == True ]]; then
+    echo "Running bedpostx..."
+    mkdir dti_preprocessed/bedpostx_input
+    ln -s ../dwi_merged-ecc.nii.gz dti_preprocessed/bedpostx_input/data.nii.gz      # n.b. link targets relative to new link location
+    ln -s ../t2w_epi_mean-brain_mask.nii.gz dti_preprocessed/bedpostx_input/nodif_brain_mask.nii.gz
+    ln -s ../dwi_merged.bval dti_preprocessed/bedpostx_input/bvals
+    ln -s ../dwi_merged.bvec dti_preprocessed/bedpostx_input/bvecs
+
+    bedpostx_datacheck dti_preprocessed/bedpostx_input > dti_preprocessed/bedpostx_datacheck.log
+    # round pixdim values to 3 decimal places to prevent spurious diff results
+    saveIFS=$IFS; IFS=$'\n'  # break only on newlines
+    for l in $(grep 'pixdim[1-3]' dti_preprocessed/bedpostx_datacheck.log); do
+        x=$(echo $l | tr -s ' ' | cut -d ' ' -f 2)
+        xx=$(printf "%0.3f\n" $x)
+        echo "$x -> $xx"
+        sed --in-place "s/$x/$xx/" dti_preprocessed/bedpostx_datacheck.log
+    done
+    IFS=$saveIFS
+
+    if [[ $bpx_chk == True ]]; then
+        if ! diff --ignore-all-space ${diff_ignore[@]:-} dti_preprocessed/bedpostx_datacheck.log ../bedpostx_datacheck.log >/dev/null; then
+            echo "Diff failed for bedpostx_datacheck.log, archiving it to ../."
+            /bin/mv dti_preprocessed/bedpostx_datacheck.log ../"$(basename $PWD)"-bedpostx_datacheck.log
+            exit 2
+        else
+            /bin/rm dti_preprocessed/bedpostx_datacheck.log
+        fi
+    fi
+
+    # Run bedpostx  (note: don't try to run as xfibres.)
+    if [[ "${sub_args:-}" ]]; then
+        # running on sharcnet gpu
+        # sqsub gpu example w/ 4 threads:
+        #   sqsub -v -q gpu -f threaded --gpp=1 -n4 -N1 -r 1h -o <OUTFILE> <JOB>
+        sub_args+=(--idfile=sqsub_jobid.txt)
+        #sub_args+=(bedpostx_gpu dti_preprocessed/bedpostx_input)
+        sub_args+=(bedpostx dti_preprocessed/bedpostx_input)
+        # echo "in dir: $PWD"
+        # echo "running sqsub with args:"
+        # echo "  ${sub_args[@]}"
+        sqsub "${sub_args[@]}"
+
+        # set up waiting job on completion
+        #   can't do this on monk GPU clusters
+        sleep 2
+        if [[ -e sqsub_jobid.txt ]]; then
+            jobid=$(cat sqsub_jobid.txt)
+            /bin/rm sqsub_jobid.txt
+            post_sub_args=(-w $jobid -o "${sub_args[1]}" -r 10m -q serial -n 1 --mpp=512M)
+            post_sub_args+=(/bin/mv -n dti_preprocessed/bedpostx_input.bedpostX dti_preprocessed/bedpostx_output)
+            # echo "submitting post-job: sqsub ${post_sub_args[@]}"
+            sqsub "${post_sub_args[@]}"
+        else
+            echo "warning: found no sqsub_jobid.txt"
+        fi
+    else
+        if [[ $run_as_nice == True ]]; then
+            nice bedpostx dti_preprocessed/bedpostx_input
+        else
+            bedpostx dti_preprocessed/bedpostx_input
+        fi
+
+        /bin/mv -n dti_preprocessed/bedpostx_input.bedpostX dti_preprocessed/bedpostx_output
+    fi
+
+    # Consider these options to bedpostx:
+    # Noise Floor Model : Use this option if (part of) the data is operating close to the noise floor.
+    # --f0 --ardf0
+    #
+    # Consider longer burn-in period (5000 iterations) to ensure convergence
+    #
+    # Consider forcing estimation of the second fiber population in every voxel (ARD=0)
+    # -w 0
+    echo "Done (bedpostx)."
+fi
+echo ""

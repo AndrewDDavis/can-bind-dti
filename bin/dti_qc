@@ -1,0 +1,398 @@
+#!/bin/bash
+
+# Generate QC parameters from preprocessed DTI data
+# See print_usage below for syntax info
+
+# v0.21 (Jul 2017) by Andrew Davis (addavis@gmail.com)
+
+# Robust scriptng options
+set -o nounset
+set -o errexit
+set -o pipefail
+shopt -s nullglob
+
+print_usage () {
+cat << EOF
+
+   $(basename $0)
+   --------
+   This script should be run from an exam directory after running
+   dti_preprocess. It creates some image overlays and pulls some stats
+   from the preprocessed DTI data to help with quality control.
+
+   Usage: $(basename $0) [options]
+
+   Options:
+     --noss: do not produce glyph screenshots
+         -q: supress output progress messages
+
+EOF
+}
+
+# Defaults
+run_afni=False
+run_dtk=False
+quiet_flag=False
+noss_flag=False
+prep_dir=dti_preprocessed
+qc_dir="${prep_dir}/qc"
+prep_logfile="${prep_dir}/dti_preprocess.log"
+qc_logfile="${qc_dir}/dti_qc.log"
+statsfile="${qc_dir}/dti_preprocess_stats.txt"
+
+# Parse arguments
+while [ $# -gt 0 ]; do
+    case $1 in
+         --noss ) noss_flag=True;;
+      -h|--help ) print_usage; exit 0;;
+     -q|--quiet ) quiet_flag=True;;
+              * ) echo "unrecognized option '$1'"; exit 2;;
+    esac
+    shift    # remove argument that has been handled
+done
+
+# Preprocessed directory check (make QC directory at same time)
+[[ -d ${prep_dir} ]] \
+  || { echo "Error: expected directory in $PWD: ${prep_dir}. Aborting. Run with '-h' for help..."; exit 2; }
+
+[[ -d "${prep_dir}"/jhu-space ]] \
+  || { echo "Error: run dti_to_jhuspace before dti_qc."; exit 2; }
+
+/bin/mkdir -p ${qc_dir}
+[[ -e ${qc_dir}/dti-fsl_glyphs_axial.png ]] \
+  && { echo "WARNING: file exists in $PWD: ${qc_dir}/dti-fsl_glyphs_axial.png.  Skipping..."; exit 0; }
+
+# Check whether AFNI was run
+afni_fa=($(find ${prep_dir} -name 'dti-afni_FA.*'))
+[[ ${#afni_fa[@]} -gt 0 ]] && run_afni=True
+
+# Check whether Diffusion Toolkit was run
+dtk_trk=($(find ${prep_dir} -name 'dti-fsl-tract_*splinefilt.trk'))
+[[ ${#dtk_trk[@]} -gt 0 ]] && run_dtk=True
+
+# Check for scripts
+if ! which mcparsplot > /dev/null; then
+    echo "Error: mcparsplot not found on path."
+    exit 2
+fi
+
+# Start the main work
+date | tee "${qc_logfile}"
+echo "Generating QC data for exam $(basename $PWD)..." | tee -a "${qc_logfile}"
+printf "Redirecting output to ${qc_logfile}\n\n"
+exec >> "${qc_logfile}"
+exec 2>&1
+#[[ quiet_flag == True ]] || set -x
+
+
+# Check to make sure ECC parameters weren't too high: currently set at any value > 20 (was > 5)
+#if grep '\([ -][5-9]\|[ -][1-9][0-9]\{1,\}\)' ${prep_dir}/dwi_merged-ecc.ecclog > /dev/null; then
+if grep '[ -][2-9][0-9]\{1,\}\.' ${prep_dir}/dwi_merged-ecc.ecclog > /dev/null; then
+    echo "WARNING: ECC parameters are very high.  Check $(basename "$PWD")/${prep_dir}/dwi_merged-ecc.ecclog"
+    #exit 2
+fi
+
+# Plot motion correction parameters
+mcparsplot -n -q ${prep_dir}/dwi_ecc-xfmPars.csv
+/bin/mv ${prep_dir}/dwi_ecc-xfmPars.png ${qc_dir}
+if [[ $quiet_flag != True ]]; then
+    echo "Check plot of ECC and motion params in qc dir:"
+    printf "  dwi_ecc-xfmPars.png\n\n"
+fi
+
+
+# Check DTI Brain Extraction
+[[ -e "${qc_dir}/t2w_epi_mean-brain_mask_check.png" ]] \
+  || ${FSLDIR}/bin/slices ${prep_dir}/t2w_epi_mean ${prep_dir}/t2w_epi_mean-brain_mask -o ${qc_dir}/t2w_epi_mean-brain_mask_check.png
+if [[ $quiet_flag != True ]]; then
+    echo "Check masking success in qc dir:"
+    printf "  t2w_epi_mean-brain_mask_check.png\n\n"
+fi
+
+
+# Generate 'Colour FA' images
+fslmaths "${prep_dir}/dti-fsl_V1.nii.gz" -abs -mul "${prep_dir}/jhu-space/dti-fsl_FA_ero.nii.gz" "${qc_dir}/dti-fsl_colourFA_floats.nii.gz"
+# This _floats image is viewable in fslview by setting the image display mode to RGB, or
+#   using ITK-SNAP and setting the Display Mode to RGB.
+if [[ $quiet_flag != True ]]; then
+    echo "Check colour FA image with fslview or ITK-SNAP in RGB display mode:"
+    echo "  ${qc_dir}/dti-fsl_colourFA_floats.nii.gz"
+fi
+
+if [[ $run_afni == True ]]; then
+    # Colour FA image with AFNI tools
+    [[ -e "${qc_dir}/dti-afni_colourFA_floats.nii.gz" ]] \
+      || 3dcalc -prefix "${qc_dir}/dti-afni_colourFA_floats.nii.gz" -a "${prep_dir}/dti-afni_V1.nii.gz" -c "${prep_dir}/dti-afni_FA.nii.gz" -expr 'c*abs(a)'
+    [[ -e "${qc_dir}/dti-afni_colourFA_RGB.nii.gz" ]] \
+      || 3dThreetoRGB -prefix "${qc_dir}/dti-afni_colourFA_RGB.nii.gz" -anat -scale 255 "${qc_dir}/dti-afni_colourFA_floats.nii.gz"
+    # This RGB image is viewable in the AFNI GUI.
+    if [[ $quiet_flag != True ]]; then
+        echo "AFNI colour FA image may be viewed with the afni GUI:"
+        echo "  ${qc_dir}/dti-afni_colourFA_RGB.nii.gz"
+    fi
+
+    # Thresholded to FA>0.25, eg.:
+    # 3dcalc -prefix DTieva00rw -a 'DTi00+orig.[9..11]' -c 'DTi00+orig.[18]' -expr 'c*STEP(c-0.25)*ABS(a)'
+
+    # Extract the R, G, B channels separately (unnecessary since we have _floats):
+    #3dcalc -rgbfac 1 0 0 -a "${qc_dir}/dti-afni_colourFA_RGB.nii.gz" -expr a -prefix "${qc_dir}/dti-afni_colourFA_red.nii.gz"
+    #3dcalc -rgbfac 0 1 0 -a "${qc_dir}/dti-afni_colourFA_RGB.nii.gz" -expr a -prefix "${qc_dir}/dti-afni_colourFA_green.nii.gz"
+    #3dcalc -rgbfac 0 0 1 -a "${qc_dir}/dti-afni_colourFA_RGB.nii.gz" -expr a -prefix "${qc_dir}/dti-afni_colourFA_blue.nii.gz"
+fi
+echo ""
+
+
+# Generate 'Glyph' images to verify gradient orientations
+#   See: http://dti-tk.sourceforge.net/pmwiki/pmwiki.php?n=Documentation.VisualizationTool
+# Quickgrab: https://github.com/vorgos/QuickGrab
+if  [[ $noss_flag == True ]]; then
+    echo "Glyph screenshots skipped..."
+elif which TVglyphView >/dev/null && which quickgrab >/dev/null; then
+    # Create eroded versions of the tensor files for cleaner glyph views
+    #   Erosion kernel should be 7.5 mm regardless of image resolution for consistency
+    if [[ ! -e "${qc_dir}"/t2w_epi_mean-brain_mask-ero.nii.gz ]]; then
+        erode_mask "${prep_dir}"/t2w_epi_mean-brain_mask.nii.gz 7.5 2
+        /bin/mv "${prep_dir}"/t2w_epi_mean-brain_mask-ero.nii.gz "${qc_dir}"
+    fi
+    
+    # consider whether to use std-space tensor images instead?
+    # e.g. command:
+    # vecreg -i ../dti-fsl_tensor -o dti-fsl_tensor-jhusp_aff -r "${FSLDIR}/data/atlases/JHU/JHU-ICBM-FA-2mm" -t reg/dti-fsl_FA_ero_to_JHU_FA_2mm_linear.xfm
+    # this standardized the views, but made pretty weird looking images, in particular low-signal tensor areas had big increases in signal
+
+
+    tmpdir=$(mktemp -d /tmp/glyphs.XXX)
+    fslmaths "${prep_dir}"/dti-fsl_tensor \
+             -mul "${qc_dir}"/t2w_epi_mean-brain_mask-ero \
+             "${tmpdir}"/dti-fsl_tensor_ero
+    fslmaths "${prep_dir}"/dti-fsl_FA \
+             -thr 0.2 -bin \
+             -mul "${tmpdir}"/dti-fsl_tensor_ero \
+             "${tmpdir}"/dti-fsl_tensor_ero
+
+    fslmaths "${prep_dir}"/dti-afni_DT \
+             -mul "${qc_dir}"/t2w_epi_mean-brain_mask-ero \
+             "${tmpdir}"/dti-afni_DT_ero
+    fslmaths "${prep_dir}"/dti-afni_FA \
+             -thr 0.2 -bin \
+             -mul "${tmpdir}"/dti-afni_DT_ero
+             "${tmpdir}"/dti-afni_DT_ero
+
+    # check in-plane image res
+    if [[ $(fslval "${prep_dir}"/dti-fsl_FA dim1) -gt 128 ]]; then
+        maxres=192
+    else
+        # many 96, but some are 112 and many are 128
+        maxres=128
+    fi
+
+    # Use expect to monitor when the viewer is ready to be captured
+    expect -c "spawn TVglyphView -in \"${tmpdir}/dti-fsl_tensor_ero.nii.gz\" -maxsize $maxres $maxres -scale 1500 -view axial;
+               set proc_id [exp_pid];
+               expect -timeout 30 \"done rendering\" { sleep 10;
+                                                       send_user \"expect: grabbing a screenshot from \$proc_id...\n\";
+                                                       spawn quickgrab -pid \$proc_id -file \"${qc_dir}/dti-fsl_glyphs_axial.png\";
+                                                       sleep 5; }"
+
+    expect -c "spawn TVglyphView -in \"${tmpdir}/dti-fsl_tensor_ero.nii.gz\" -maxsize $maxres $maxres -scale 1500 -view coronal;
+               set proc_id [exp_pid];
+               expect -timeout 30 \"done rendering\" { sleep 10;
+                                                       send_user \"expect: grabbing a screenshot from \$proc_id...\n\";
+                                                       spawn quickgrab -pid \$proc_id -file \"${qc_dir}/dti-fsl_glyphs_coronal.png\";
+                                                       sleep 5; }"
+
+    if [[ $run_afni == True ]]; then
+        expect -c "spawn TVglyphView -in \"${tmpdir}/dti-afni_DT_ero.nii.gz\" -maxsize $maxres $maxres -scale 1.5 -view axial;
+                   set proc_id [exp_pid];
+                   expect -timeout 30 \"done rendering\" { sleep 10;
+                                                           send_user \"expect: grabbing a screenshot from \$proc_id...\n\";
+                                                           spawn quickgrab -pid \$proc_id -file \"${qc_dir}/dti-afni_glyphs_axial.png\";
+                                                           sleep 5; }"
+
+        expect -c "spawn TVglyphView -in \"${tmpdir}/dti-afni_DT_ero.nii.gz\" -maxsize $maxres $maxres -scale 1.5 -view coronal;
+                   set proc_id [exp_pid];
+                   expect -timeout 30 \"done rendering\" { sleep 10;
+                                                           send_user \"expect: grabbing a screenshot from \$proc_id...\n\";
+                                                           spawn quickgrab -pid \$proc_id -file \"${qc_dir}/dti-afni_glyphs_coronal.png\";
+                                                           sleep 5; }"
+    fi
+
+    if [[ $quiet_flag != True ]]; then
+        echo "Check tensor orientations by viewing glyphs:"
+        echo "  ${qc_dir}/dti-fsl_glyphs_axial.png"
+        echo "  ${qc_dir}/dti-fsl_glyphs_coronal.png"
+        echo "  ${qc_dir}/dti-afni_glyphs_axial.png"
+        echo "  ${qc_dir}/dti-afni_glyphs_coronal.png"
+        printf "Recommended checks are corpus collosum and internal capsule.\n\n"
+    fi
+
+    # clean up
+    /bin/rm -r "${tmpdir}"
+
+elif [[ $quiet_flag != True ]]; then
+    echo "To check tensor orientations by viewing glyphs, install DTI-TK from"
+    echo " http://dti-tk.sourceforge.net and use:"
+    echo "  TVglyphView -in ${prep_dir}/dti-fsl_tensor_ero.nii.gz -scale 1500 -view axial"
+    echo "  TVglyphView -in ${prep_dir}/dti-fsl_tensor_ero.nii.gz -scale 1500 -view coronal"
+    if [[ $run_afni == True ]]; then
+        echo "  TVglyphView -in ${prep_dir}/dti-afni_DT_ero.nii.gz -scale 1.5 -view axial"
+        echo "  TVglyphView -in ${prep_dir}/dti-afni_DT_ero.nii.gz -scale 1.5 -view coronal"
+    fi
+    printf "Recommended checks are corpus collosum and internal capsule.\n\n"
+fi
+
+
+# Checking entails two steps:
+#   1. Check if the tensors are oriented correctly in the genu and the splenium
+#      of the corpus callosum in the axial view. The tensors' major axes should be
+#      clearly aligned along the boundary of the genu and the splenium.
+#   2. Check if the tensors are oriented correctly in the internal capsule and the
+#      midbody of the corpus callosum in the coronal view. Again, the tensors should
+#      be properly aligned with the boundary of these structures. 
+
+
+# Check registration of anatomical to diffusion space
+if [[ -e ${prep_dir}/t1_anat-diff_space.nii.gz ]]; then
+    ${FSLDIR}/bin/slices ${prep_dir}/t2w_epi_mean-brain ${prep_dir}/t1_anat-diff_space -o ${qc_dir}/t1_anat-to-t2w_epi_reg_check.png
+    if [[ $quiet_flag != True ]]; then
+        echo "Anatomical -> Diffusion transformation matrix was:"
+        while read line; do printf "% 8.4f % 8.4f % 8.4f % 8.4f\n" $line; done < ${prep_dir}/t1_anat-to-t2w_epi.xfm
+        echo "Check registration in qc dir:"
+        printf "  t1_anat-to-t2w_epi_reg_check.png\n\n"
+    fi
+fi
+
+# Check Normalization to FMRIB58
+if [[ -e ${prep_dir}/fmrib58_FA_1mm-diff_space_nonlinear.nii.gz ]]; then
+    ${FSLDIR}/bin/slices ${prep_dir}/dti-fsl_FA ${prep_dir}/fmrib58_FA_1mm-diff_space_nonlinear -o ${qc_dir}/fmrib58_FA_1mm-diff_space_check.png
+    if [[ $quiet_flag != True ]]; then
+        echo "Check normalization in qc dir:"
+        printf "  fmrib58_FA_1mm-diff_space_check.png\n\n"
+    fi
+fi
+
+# Check fibre tracts from Diffusion Toolkit and AFNI
+if [[ $run_dtk == True ]]; then
+    if [[ $quiet_flag != True ]]; then
+        echo "Check FSL fibre tracks with:"
+        echo " $ TrackVis $dtk_trk"
+    fi
+    tv_out="${qc_dir}/$(basename "${dtk_trk%.trk}-screen_cap.png")"
+    [[ -e "$tv_out" ]] \
+      || { track_vis "$dtk_trk" -l 60 -sc "$tv_out" 1 1 1 4
+           /bin/rm tmp.cam track_vis.log; }       # clean up after track_vis
+    if [[ $quiet_flag != True ]]; then
+        echo "Tracks screen cap in qc dir:"
+        printf "  ${tv_out#$qc_dir/}\n\n"
+    fi
+
+    # Commented because it doesn't seem to actually underlay the t1_anat:
+    #track_vis ${prep_dir}/dti-fsl_tensor-50deg-splinefilt.trk -l 70 -b t1_anatomical.nii.gz
+    # note also that trying to use track_transform to put tracts in hi-res space gave inverted results
+fi
+if [[ $run_afni == True ]]; then
+    if [[ $quiet_flag != True ]]; then
+        echo "Check AFNI deterministic fibre tracks with:"
+        printf " $ TrackVis ${prep_dir}/dti-afni-trackid_det_000.trk\n\n"
+    fi
+fi
+
+
+# Write some stats to the QC dir
+[[ -e ${statsfile} ]] && /bin/rm ${statsfile}
+touch ${statsfile}
+# From FSL dti data
+[[ $quiet_flag != True ]] && echo "Writing stats for FSL output..."
+fsl_tracno=$(grep -B1 "Done (FSL fibres)." ${prep_logfile} | head -1 | sed 's/Number of tracks: //')
+echo 'FSL stats from rough masks:' >> ${statsfile}
+printf '%12s: %s\n' "no. tracts" $fsl_tracno >> ${statsfile}
+
+# Generate mask by thresholding atlas to FA=0.3 and grab FA stats...
+if [[ -e ${prep_dir}/fmrib58_FA_1mm-diff_space_nonlinear.nii.gz ]]; then
+    fslmaths ${prep_dir}/fmrib58_FA_1mm-diff_space_nonlinear \
+                -thr 3000 \
+                -bin \
+                ${prep_dir}/fmrib58_FA_1mm-diff_space-bin_mask
+    atlas_FA=($(fslstats ${prep_dir}/fmrib58_FA_1mm-diff_space_nonlinear -k ${prep_dir}/fmrib58_FA_1mm-diff_space-bin_mask -M -S))
+    atlas_FA=($(for v in ${atlas_FA[@]}; do echo "scale=4; ${v}/10000" | bc; done))   # atlas values are FA*10000
+    WM_FA=($(fslstats ${prep_dir}/dti-fsl_FA -k ${prep_dir}/fmrib58_FA_1mm-diff_space-bin_mask -M -S))
+    WM_MD=($(fslstats ${prep_dir}/dti-fsl_MD -k ${prep_dir}/fmrib58_FA_1mm-diff_space-bin_mask -M -S))
+    WM_MD=($(for v in ${WM_MD[@]}; do echo "scale=4; ${v}*1000" | bc; done))     # FSL values in mm^2/s
+    WM_SSE=($(fslstats ${prep_dir}/dti-fsl_sse -k ${prep_dir}/fmrib58_FA_1mm-diff_space-bin_mask -M -S))
+
+    printf '%12s: %0.3f (%0.3f)\n' "atlas_FA" "${atlas_FA[0]}" "${atlas_FA[1]}" >> ${statsfile}
+    printf '%12s: %0.3f (%0.3f)\n' "WM_FA" "${WM_FA[0]}" "${WM_FA[1]}" >> ${statsfile}
+    printf '%12s: %0.3f (%0.3f) x10^-3 mm^2/s\n' "WM_MD" "${WM_MD[0]}" "${WM_MD[1]}" >> ${statsfile}
+    printf '%12s: %0.3f (%0.3f)\n' "WM_SSE" "${WM_SSE[0]}" "${WM_SSE[1]}" >> ${statsfile}
+
+
+    # Generate CSF mask by thresholding t2w epi image
+    # CSF mask: T2w signal > 5000 (really greater than 60% of max robust threshold value)
+    fslmaths ${prep_dir}/t2w_epi_mean-brain \
+                -thrP 60 \
+                -bin \
+                ${prep_dir}/t2w_epi_mean-CSF_mask
+    CSF_FA=($(fslstats ${prep_dir}/dti-fsl_FA -k ${prep_dir}/t2w_epi_mean-CSF_mask -M -S))
+    CSF_MD=($(fslstats ${prep_dir}/dti-fsl_MD -k ${prep_dir}/t2w_epi_mean-CSF_mask -M -S))
+    CSF_MD=($(for v in ${CSF_MD[@]}; do echo "scale=4; ${v}*1000" | bc; done))
+
+    printf '%12s: %0.3f (%0.3f)\n' "CSF_FA" "${CSF_FA[0]}" "${CSF_FA[1]}" >> ${statsfile}
+    printf '%12s: %0.3f (%0.3f) x10^-3 mm^2/s\n' "CSF_MD" "${CSF_MD[0]}" "${CSF_MD[1]}" >> ${statsfile}
+
+
+    # Generate GM (really leftover) mask: voxels are in brain, but not in WM or CSF masks, FA < 0.15, T2w signal < 3000
+    fslmaths ${prep_dir}/fmrib58_FA_1mm-diff_space_nonlinear \
+                -thr 2000 \
+                -bin \
+                ${prep_dir}/fmrib58_FA_1mm-diff_space-2000_mask
+    fslmaths ${prep_dir}/t2w_epi_mean-brain \
+                -thrP 40 \
+                -bin \
+                ${prep_dir}/t2w_epi_mean-40p_mask
+    fslmaths ${prep_dir}/qc/t2w_epi_mean-brain_mask-ero \
+                -sub ${prep_dir}/fmrib58_FA_1mm-diff_space-2000_mask \
+                -sub ${prep_dir}/t2w_epi_mean-40p_mask \
+                -thr 0 \
+                ${prep_dir}/t2w_epi_mean-leftover_mask
+    GM_FA=($(fslstats ${prep_dir}/dti-fsl_FA -k ${prep_dir}/t2w_epi_mean-leftover_mask -M -S))
+    GM_MD=($(fslstats ${prep_dir}/dti-fsl_MD -k ${prep_dir}/t2w_epi_mean-leftover_mask -M -S))
+    GM_MD=($(for v in ${GM_MD[@]}; do echo "scale=4; ${v}*1000" | bc; done))
+
+    printf '%12s: %0.3f (%0.3f)\n' "GM_FA" "${GM_FA[0]}" "${GM_FA[1]}" >> ${statsfile}
+    printf '%12s: %0.3f (%0.3f) x10^-3 mm^2/s\n\n' "GM_MD" "${GM_MD[0]}" "${GM_MD[1]}" >> ${statsfile}
+
+    /bin/rm ${prep_dir}/fmrib58_FA_1mm-diff_space-bin_mask.nii* \
+            ${prep_dir}/t2w_epi_mean-CSF_mask.nii* \
+            ${prep_dir}/fmrib58_FA_1mm-diff_space-2000_mask.nii* \
+            ${prep_dir}/t2w_epi_mean-40p_mask.nii* \
+            ${prep_dir}/t2w_epi_mean-leftover_mask.nii*
+fi
+
+# From AFNI dti data
+if [[ $run_afni == True ]]; then
+    [[ $quiet_flag != True ]] && echo "Writing stats for AFNI output..."
+    echo 'AFNI stats from afni-generated masks:' >> ${statsfile}
+    afni_tracno=$(grep '++ From tracking, net\[0\] has' ${prep_logfile} | sed 's/++ From tracking, net\[0\] has //' | sed 's/ tracks.//')
+    printf '%12s: %s\n' "AFNI tracts" $afni_tracno >> ${statsfile}
+    # get more stats from 3dTrackID from .grid file: 
+    # FA and sFA, MD and sMD, RD and sRD, fNV (fractional volume of tracks compared to masked 
+    #   (internally or '-mask'edly) total volume; would perhaps be useful if said mask represents
+    #    the whole brain volume well.)
+    gridfile=${prep_dir}/dti-afni-trackid_det_000.grid
+    afni_fNV=$(grep -A1 fNV $gridfile | tail -1)
+    afni_FA[0]=$(grep -A1 "# FA" $gridfile | tail -1)
+    afni_FA[1]=$(grep -A1 "# sFA" $gridfile | tail -1)
+    afni_MD[0]=$(grep -A1 "# MD" $gridfile | tail -1)
+    afni_MD[1]=$(grep -A1 "# sMD" $gridfile | tail -1)
+    afni_RD[0]=$(grep -A1 "# RD" $gridfile | tail -1)
+    afni_RD[1]=$(grep -A1 "# sRD" $gridfile | tail -1)
+    printf '%12s: %0.3f\n' "afni_fNV" "$afni_fNV" >> ${statsfile}
+    printf '%12s: %0.3f (%0.3f)\n' "afni_FA" "${afni_FA[0]}" "${afni_FA[1]}" >> ${statsfile}
+    printf '%12s: %0.3f (%0.3f) x10^-3 mm^2/s\n' "afni_MD" "${afni_MD[0]}" "${afni_MD[1]}" >> ${statsfile}
+    printf '%12s: %0.3f (%0.3f) x10^-3 mm^2/s\n' "afni_RD" "${afni_RD[0]}" "${afni_RD[1]}" >> ${statsfile}
+fi
+
+
+# Done
+printf "\n"
+exit 0

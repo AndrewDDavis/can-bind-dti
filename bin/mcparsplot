@@ -1,0 +1,266 @@
+#!/usr/bin/env python
+"""not intended as a module"""
+from __future__ import division
+import plac
+
+@plac.annotations(
+    pars_file="CSV file with 13 columns of MC parameters",
+    quiet=("suppresses showing the plot", 'flag', 'q'),
+    noptp=("not print targeted", 'flag', 'n'),
+    frames=("frames to plot, eg. '123-456' or '87-', inclusive, 0-based", 'option'),
+    tr=("plot in seconds, converting with tr", 'option'),
+    outp=("output file prefix for plot and text file", 'option'))
+
+def main(pars_file, quiet, noptp, frames=None, tr=None, outp=None):
+    """Plot motion correction columns.
+
+    Example: mcParsPlot.py s09-Bsel-smc-affinePars.csv
+    """
+
+    import os
+    import numpy as np
+    import matplotlib.pyplot as plt
+    import csv
+    if not noptp:
+        import print_targeted_plots as ptp
+
+    assert os.path.isfile(pars_file)        # assert file exists
+
+    # File prefix
+    if outp is None:
+        outfile_prefix = pars_file.rsplit('.',1)[0]
+
+    # Read values and generate plotting vector
+    rot_x, rot_y, rot_z, trans_x, trans_y, trans_z, scale_x, scale_y, scale_z, skew_x, skew_y, skew_z, avg_scale = np.loadtxt(pars_file, skiprows=1, unpack=True)
+
+    # Convert rotations to degrees
+    rot_x = rot_x*180/np.pi
+    rot_y = rot_y*180/np.pi
+    rot_z = rot_z*180/np.pi
+
+    # plot only certain frames
+    if frames is not None:
+        frs = frames.split('-')
+        try:
+            start_frame = int(frs[0])
+        except ValueError:
+            print("not an integer: {}".format(frs[0]))
+            raise
+        if len(frs[1]) == 0:
+            #end_frame = len(rot_x)
+            end_frame = start_frame + 2880
+            print("Info: Using end_frame={}".format(end_frame))
+        else:
+            end_frame = int(frs[1]) + 1
+
+        if end_frame > len(rot_x):
+            print("Warning: end_frame of {} greater than len(rot_x) ({})".format(end_frame, len(rot_x)))
+
+        # for s in rot_x, rot_y, rot_z, trans_x, trans_y, trans_z, scale_x, scale_y, scale_z, skew_x, skew_y, skew_z, avg_scale:
+        #     s = s[start_frame:end_frame]
+        # ^^ doesn't work.  I forget if this style is possible in python.
+
+        rot_x = rot_x[start_frame:end_frame]
+        rot_y = rot_y[start_frame:end_frame]
+        rot_z = rot_z[start_frame:end_frame]
+        trans_x = trans_x[start_frame:end_frame]
+        trans_y = trans_y[start_frame:end_frame]
+        trans_z = trans_z[start_frame:end_frame]
+        scale_x = scale_x[start_frame:end_frame]
+        scale_y = scale_y[start_frame:end_frame]
+        scale_z = scale_z[start_frame:end_frame]
+        skew_x = skew_x[start_frame:end_frame]
+        skew_y = skew_y[start_frame:end_frame]
+        skew_z = skew_z[start_frame:end_frame]
+        avg_scale = avg_scale[start_frame:end_frame]
+
+    # x-axis vector to plot against
+    n = len(rot_x)
+    frame_vec = np.arange(0, n)
+    if tr:
+        frame_vec = frame_vec*float(tr)
+        if n*tr > 120:
+            frame_vec = frame_vec/60.0
+            frame_vec_units = "min"
+        else:
+            frame_vec_units = "s"
+
+    print('Plotting {} points...'.format(n))
+
+    if not noptp:
+        # Specify plotting line weights
+        font_size = 8
+        ptp.set_ink_weight(font_size)   # attempt to set line weights in advance to match the font size
+
+    # Check whether there are only 3 or 5 degrees of freedom in the registration, otherwise assume 6
+    if ((np.max(rot_x) - np.min(rot_x)) < 1e-3) & \
+       ((np.max(rot_y) - np.min(rot_y)) < 1e-3) & \
+       ((np.max(trans_z) - np.min(trans_z)) < 1e-3):
+    	if ((np.max(scale_x) - np.min(scale_x)) < 1e-3) & \
+    	   ((np.max(scale_x) - np.min(scale_x)) < 1e-3):
+        	dof = 3
+        	plot_cnt = 1
+        	fig_size = [3.37, 2.02]
+        else:
+        	dof = 5
+        	plot_cnt = 2
+        	fig_size = [3.37, 3.37]
+    else:
+        dof = 6
+        plot_cnt = 2
+        fig_size = [3.37, 3.37]
+    print("detected dof: {}".format(dof))
+
+    # Set up figure
+    figh, axh = plt.subplots(plot_cnt, 1, sharex=True, figsize=fig_size, dpi=150)  # size in inches, dpi for display
+    try:
+        for ax in axh:
+            ax.hold(True)
+        axr = axh[0]
+    except TypeError:
+        axh.hold(True)
+        axr = axh
+
+    # Rotations
+    axr.plot(frame_vec, rot_z, label='z')
+
+    if dof == 6:
+        axr.plot(frame_vec, rot_x, label='x')
+        axr.plot(frame_vec, rot_y, label='y')
+
+    axr.set_ylabel('Rotation (degrees)')
+    #axr.set_xlabel('Frame')
+    legh = axr.legend(loc='upper left', fancybox=True)
+    legh.get_frame().set_alpha(0.6)
+
+    # Translations
+    if dof == 6:
+        axt = axh[1]
+    else:
+        axt = axr.twinx()
+        axt.hold(True)
+        axt._get_lines.prop_cycler.next()['color']  # skip the color already plotted on axr
+
+    axt.plot(frame_vec, trans_x, label='x')
+    axt.plot(frame_vec, trans_y, label='y')
+
+    if dof == 6:
+        axt.plot(frame_vec, trans_z, label='z')
+
+    axt.set_ylabel('Translation (mm)')
+    if tr:
+        axr.set_xlabel('Time (' + frame_vec_units + ')')
+    else:
+        axr.set_xlabel('Frame')
+    legt = axt.legend(loc='upper right', fancybox=True)
+    legt.get_frame().set_alpha(0.6)
+
+    # Scales
+    if dof == 5:
+        axh[1].plot(frame_vec, scale_x, label='x')
+        axh[1].plot(frame_vec, scale_y, label='y')
+
+        axh[1].set_ylabel('Scale')
+        if tr:
+            axh[1].set_xlabel('Time (' + frame_vec_units + ')')
+        else:
+            axh[1].set_xlabel('Frame')
+        legs = axh[1].legend(loc='upper right', fancybox=True)
+        legs.get_frame().set_alpha(0.6)
+
+
+    # Finish, save, show
+    if not noptp:
+        ptp.adjust_label_padding(font_size)
+        ptp.adjust_grid_dashes(font_size)
+        #ptp.adjust_eb_caps(font_size, caps1+caps2)
+
+    if outp is None:
+        figh.savefig(outfile_prefix + '.png', dpi=600)#, bbox_inches='tight')
+    else:
+        figh.savefig(outp + '.png', dpi=600)#, bbox_inches='tight')
+        if dof == 3:
+            with open(outp + '.csv', 'w') as of:
+                csvw = csv.writer(of)
+                csvw.writerow(('rot_z', 'trans_x', 'trans_y'))
+                O = np.vstack((rot_z, trans_x, trans_y)).transpose()    # 3 columns
+                csvw.writerows(O)
+
+    # report range, variance of signals
+    if dof == 3:
+        ranges = []
+        stdevs = []
+        def report_sig_attrs(sig, signame):
+            sig_range = sig.max() - sig.min()
+            ranges.append(sig_range)
+            print("{} range: {:.1e}".format(signame, sig_range))
+
+            sig_std = sig.std()
+            stdevs.append(sig_std)
+            print("{} stdev: {:.1e}".format(signame, sig_std))
+
+        report_sig_attrs(rot_z, 'rot_z')
+        report_sig_attrs(trans_x, 'trans_x')
+        report_sig_attrs(trans_y, 'trans_y')
+
+        tot_range = np.array(ranges).sum()
+        tot_stdev = np.array(stdevs).sum()
+        print("total range: {:.1e}".format(tot_range))
+        print("total stdev: {:.1e}".format(tot_stdev))
+
+
+    if not quiet:
+        plt.show()
+        #sleep(5)
+        #plt.close(figh)
+
+
+    # Calculate a single displacement value from the rotation and translations
+    # use a voxel at the radius of the leg, about 56 mm
+    if dof == 3 or dof == 5:
+        displ = np.sqrt(trans_x**2 + trans_y**2) + np.abs(rot_z*56.0*np.pi/180)
+        if dof == 5:
+            displ = displ + np.sqrt((56*(scale_x-1))**2 + (56*(scale_y-1))**2)
+
+        figh, axh = plt.subplots(figsize=[3.37, 2.02], dpi=150)
+        axh.plot(frame_vec, displ, label='displ')
+        if tr:
+            axh.set_xlabel('Time (' + frame_vec_units + ')')
+        else:
+            axh.set_xlabel('Frame')
+        axh.set_ylabel('Displacementosity (mm)')
+
+        print("max displacementosity (mm): {:01.3f}".format(np.max(displ)))
+        # Finish, save, show
+        if not noptp:
+            ptp.adjust_label_padding(font_size)
+            ptp.adjust_grid_dashes(font_size)
+            #ptp.adjust_eb_caps(font_size, caps1+caps2)
+
+        if outp is None:
+            figh.savefig(outfile_prefix + '-displ.png', dpi=600)
+        else:
+            figh.savefig(outp + '-displ.png', dpi=600)
+            if dof == 3:
+                with open(outp + '-displ.csv', 'w') as of:
+                    csvw = csv.writer(of)
+                    csvw.writerow(('displ'))
+                    O = np.vstack((displ)).transpose()    # column
+                    csvw.writerows(O)
+
+
+        if not quiet:
+            plt.show()
+        # import ipdb; ipdb.set_trace()
+
+        # transform matrix
+        # gamma = rot_z*np.pi/180
+        # T = [np.cos(gamma), -1*np.sin(gamma), 0, trans_x;
+        #      np.sin(gamma),    np.cos(gamma), 0, trans_y;
+        #      0,                0,             1, 0      ;
+        #      0,                0,             0, 1      ]
+
+
+# Entry point
+if __name__ == '__main__':
+    plac.call(main)

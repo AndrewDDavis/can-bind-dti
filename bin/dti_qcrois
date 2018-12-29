@@ -1,0 +1,117 @@
+#!/bin/bash
+
+# v0.2 (Feb 2018) by Andrew Davis (addavis@gmail.com)
+
+# Transforms background ROI mask and CC WM ROI from jhu-space to
+#   subject DTI space. Also generates 'safe' global WM mask.
+#   Generates png overlay images to check the transformations.
+
+# Example:
+# cd subj_0001_01/dti_preprocessed
+# dti_qcrois
+
+rois_dir=~/Documents/CAN-BIND/CAN-BIND_DTI/data/ROIs
+
+[[ -e t2w_epi_mean.nii.gz ]] || { echo "t2w_epi_mean not found"; exit 2; }
+[[ -e jhu-space/reg/dti-fsl_FA_ero_to_JHU_FA_2mm_linear.xfm ]] || { echo "dti-fsl_FA_ero_to_JHU_FA_2mm_linear.xfm not found"; exit 2; }
+[[ -e "$rois_dir"/BG_ROI/JHU-ICBM-2mm_FullBG_mask.nii.gz ]] || { echo "JHU-ICBM-2mm_FullBG_mask not found."; exit 2; }
+[[ -e "$rois_dir"/4_ROIs/CC-ROI.nii.gz ]] || { echo "CC-ROI not found."; exit 2; }
+[[ -d qc ]] || { echo "qc dir not found"; exit 2; }
+
+
+# Background mask
+# Convert from mine drawn on JHU DWI image in fsleyes
+echo "$(basename $0): Background mask..."
+
+convert_xfm -omat jhu-space/reg/JHU-ICBM-2mm_to_dti_linear.xfm \
+            -inverse jhu-space/reg/dti-fsl_FA_ero_to_JHU_FA_2mm_linear.xfm
+
+flirt -in "$rois_dir"/BG_ROI/JHU-ICBM-2mm_FullBG_mask \
+      -ref dwi_merged-ecc \
+      -applyxfm -init jhu-space/reg/JHU-ICBM-2mm_to_dti_linear.xfm \
+      -out qc/dwi-bg_mask \
+      -interp nearestneighbour \
+      -datatype char
+
+
+# Global WM ROI
+# Threshold FA > 0.3, fill holes, restrict to conservative brain mask
+echo "$(basename $0): Global WM ROI..."
+
+mkdir -p qc
+if [[ ! -e qc/t2w_epi_mean-brain_mask-ero.nii.gz ]]; then
+    erode_mask t2w_epi_mean-brain_mask.nii.gz 7.5 2
+    /bin/mv t2w_epi_mean-brain_mask-ero.nii.gz qc/
+fi
+
+fslmaths dti-fsl_FA \
+         -thr 0.3 -bin \
+         -kernel box 7.5 -dilD -ero \
+         -mul qc/t2w_epi_mean-brain_mask-ero \
+         qc/dwi-glb_wm_mask \
+         -odt char
+
+
+# CC WM ROI
+# Transform, convolve with global WM and check
+echo "$(basename $0): CC WM ROI..."
+
+applywarp -i "$rois_dir"/4_ROIs/CC-ROI \
+          -r dwi_merged-ecc \
+          -w jhu-space/reg/JHU_FA_2mm_to_dti-fsl_FA_ero_nonlinear_cout_warpfields \
+          --interp=nn \
+          -o qc/dwi-cc_roi \
+          --datatype=char
+
+fslmaths qc/dwi-cc_roi \
+         -mul qc/dwi-glb_wm_mask \
+         qc/dwi-cc_roi-safe \
+         -odt char
+/bin/mv -f qc/dwi-cc_roi-safe.nii.gz qc/dwi-cc_roi.nii.gz
+
+
+# Lat Vent ROI
+# Transform, convolve with brain mask and check
+echo "$(basename $0): LV ROI..."
+
+applywarp -i "$rois_dir"/4_ROIs/Lat_vent_ROI_from_JHUT2 \
+          -r dwi_merged-ecc \
+          -w jhu-space/reg/JHU_FA_2mm_to_dti-fsl_FA_ero_nonlinear_cout_warpfields \
+          --interp=nn \
+          -o qc/dwi-lv_roi \
+          --datatype=char
+
+# safe to erode masking on 256
+if [[ $(fslval t2w_epi_mean-brain_mask dim1) -eq 256 ]]; then
+    ero_args=(-ero)
+else
+    ero_args=()
+fi
+fslmaths qc/dwi-lv_roi \
+         -mul qc/t2w_epi_mean-brain_mask-ero \
+         ${ero_args[@]} \
+         qc/dwi-lv_roi-safe \
+         -odt char
+/bin/mv -f qc/dwi-lv_roi-safe.nii.gz qc/dwi-lv_roi.nii.gz
+
+lvroi_max=$(fslstats qc/dwi-lv_roi.nii.gz -R | cut -d ' ' -f 2)
+if [[ $(pycalc "${lvroi_max} == 0.00") == True ]]; then
+    echo "$(basename $0): Error: LV ROI is zero everywhere."
+    exit 2
+fi
+
+
+# Check masks with images
+echo "$(basename $0): Checking ROIs..."
+# use t2w_epi_mean as background, normalizing median CSF levels to 1000
+csflev=$(fslstats t2w_epi_mean -k qc/dwi-lv_roi -p 50 | tr -d ' ')
+f=$(pycalc "1000/$csflev")
+echo "$(basename $0):   f=$f"
+# highlev=$(fslstats t2w_epi_mean -r | cut -d ' ' -f 2)
+# f=$(pycalc "10000/$highlev")
+fslmaths t2w_epi_mean -mul $f qc/t2w_epi_mean-norm -odt float
+
+slicer qc/t2w_epi_mean-norm qc/dwi-bg_mask -i 0 100 -a qc/bgmask_check.png
+slicer qc/t2w_epi_mean-norm qc/dwi-glb_wm_mask -i 0 1200 -a qc/gwmmask_check.png
+slicer qc/t2w_epi_mean-norm qc/dwi-cc_roi -i 0 1200 -a qc/ccroi_check.png
+slicer qc/t2w_epi_mean-norm qc/dwi-lv_roi -i 0 1200 -a qc/lvroi_check.png

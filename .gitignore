@@ -1,0 +1,12 @@
+.DS_Store
+.~lock.*
+
+*.pyc
+
+/archive/
+/testing/
+/data/
+/cb_dti.sublime-workspace
+
+/src/pymer4_dev
+src/statsmodels_dev

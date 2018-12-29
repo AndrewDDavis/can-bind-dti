@@ -1,0 +1,54 @@
+#!/bin/bash
+
+# v0.1 (Feb 2018) by Andrew Davis (addavis@gmail.com)
+
+# Calculates some noise measures from the ROIs generated from
+#   dti_qcrois
+
+# Example:
+# cd subj_0001_01/dti_preprocessed
+# dti_qcnoise
+
+[[ -d qc ]] || { echo "qc dir not found"; exit 2; }
+[[ -e qc/dwi-glb_wm_mask.nii.gz ]] || { echo "dwi-glb_wm_mask not found"; exit 2; }
+[[ -e qc/dwi-bg_mask.nii.gz ]] || { echo "dwi-bg_mask not found"; exit 2; }
+[[ -e qc/t2w_epi_mean-norm.nii.gz ]] || { echo "t2w_epi_mean-norm not found"; exit 2; }
+
+# WM SNR and Noise
+
+estimatesnr -bgmask qc/dwi-glb_wm_mask.nii.gz \
+            -schemefile camino/dwi_merged-eccrot.scheme \
+            -inputfile dwi_merged-ecc.nii.gz \
+            > camino/wmsnr_out.txt
+
+wmsnr=$(grep "SNR mult" camino/wmsnr_out.txt | cut -f 3)
+wmnoise_sig=$(grep "sigma mult" camino/wmsnr_out.txt | cut -f 3)
+
+
+# BG Noise
+
+datastats -inputfile dwi_merged-ecc.nii.gz \
+          -schemefile camino/dwi_merged-eccrot.scheme \
+          -bgmask qc/dwi-bg_mask.nii.gz \
+          -maskdatatype char \
+          > camino/bgstats_out.txt
+
+# Calculate noise from sqrt(E(S^2)/2) of first b=0 volume
+es2=$(cat camino/bgstats_out.txt | grep '^ 1 ' | tr -s ' ' | cut -d ' ' -f 4)
+bg_noise=$(pycalc "sqrt(${es2}/2)" 2)
+
+
+# Ringing measures
+
+cc_stats=($(fslstats qc/t2w_epi_mean-norm -k qc/dwi-cc_roi -m -s -e))
+cc_mean=$(pycalc ${cc_stats[0]} 2)
+cc_std=$(pycalc ${cc_stats[1]} 2)
+cc_entropy=$(pycalc ${cc_stats[2]} 5)
+cc_cv=$(pycalc "$cc_std/$cc_mean" 5)
+
+
+# Write out stats to text file
+subjid=$(basename $(dirname ${PWD}))  # example: UCA_0022_03
+str_format="%12s,%12s,%12s,%12s,%12s,%12s\n"
+printf $str_format  subjid  wmsnr  wmnoise_sig  bg_noise  cc_entropy  cc_cv > qc/qcnoise_stats.csv
+printf $str_format $subjid $wmsnr $wmnoise_sig $bg_noise $cc_entropy $cc_cv >> qc/qcnoise_stats.csv

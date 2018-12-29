@@ -1,0 +1,304 @@
+#!/bin/bash
+
+# v0.1 (Jan 2018) by Andrew Davis (addavis@gmail.com)
+
+printUsage() {
+cat << EOF
+
+    $(basename $0)
+    --------------
+
+    This script is run on Sharcnet to process DTI scans with probtrack_prep,
+    which runs FSL and AFNI to prepare data for probabilistic tracking. That
+    script works on preprocessed DTI scans under the
+    /work/davisad/CAN-BIND_DTI/data/phase_[ab]/[site] directories. Specify a
+    site dir that contains preprocessed data in subject directories. probtrack_prep
+    works on dti_preprocessed directories and outputs to those directories, with
+    stdout and stderr going to bpx_job.log.
+
+    Usage: $(basename $0) [options] site_or_subj_dir
+
+    Usual options:
+      -n         : do not run sqsub (testing)
+      -p ab      : set data phase a or b (default b)
+
+    Uncommon options (mostly for initial testing):
+      -c num     : set number of cores (default 1)
+      -q queue   : queue (default serial, can do threaded, or gpu)
+      -m amt     : set memory per core to amt (default 1.5g)
+      -r time    : set run_time (default 36h)
+
+    Esoteric options:
+      -s         : use scratch for all I/O
+      -o node_id : submit one job to node_id, then break
+
+    Other modes:
+      -z         : check for non-zero exit status runs, in subj_dir as absolute
+                     or relative path
+      -y         : re-run without the bedpostx_datacheck, discarding files from
+                     previous run, in subj_dir as absolute or relative path
+      --afnirun  : run afni only
+      --fslrun   : run fsl bedpostx only (on cpu, could not get gpu to work)
+
+    Examples:
+      Processing on CAM phase B data (remove -n to run):
+      submit_bpx_jobs -n -p b CAM_B
+
+      Check for non-zero output ptp runs under the current dir:
+      cd "/work/davisad/CAN-BIND_DTI/data/phase_b/CAM_B"
+      submit_bpx_jobs -z .
+
+      Restart a subject after examining the bedpostx_datacheck.log diff:
+      cd "/work/davisad/CAN-BIND_DTI/data/phase_b/CAM_B/CAM_0015_01"
+      submit_bpx_jobs -y CAM_0029_01
+
+      Run a particular trial:
+      submit_bpx_jobs -n -p b MCU_B/MCU_0015_02
+
+      Run afni only (e.g. on Orca or Goblin):
+      submit_bpx_jobs -n --afnirun -p a UCA256-new
+
+      Run fsl only (e.g. on Monk):
+      submit_bpx_jobs -n --fslrun -p a UCA256-new
+
+EOF
+}
+
+# defaults
+run_sqsub=True
+node_id=""
+base_dir=work
+data_phase=phase_b      # phase_a or phase_b CBN01 data
+run_time=36h
+queue=serial
+cores=1
+mpp=1.5g
+nobpxchk_mode=False
+check_mode=False
+afnirun=False
+fslrun=False
+
+# args
+[[ $# -eq 0 ]] && { printUsage; exit 1; }
+[[ $# -eq 1 ]] && [[ $1 == "-h" || $1 == "--help" ]] && { printUsage; exit 0; }
+
+while [[ $# -gt 1 ]]; do
+       case $1 in
+         -c ) cores=$2; shift;;
+         -m ) mpp=$2; shift;;
+         -n ) run_sqsub=False;;
+         -o ) node_id=$2; shift;;
+         -p ) data_phase=phase_${2}; shift;;
+         -q ) queue=$2; shift;;
+         -r ) run_time=$2; shift;;
+         -s ) base_dir=scratch;;
+         -y ) nobpxchk_mode=True;;
+         -z ) check_mode=True;;
+  --afnirun ) cores=2; queue=threaded; run_time=90m; mpp=1.5g; afnirun=True;;
+   --fslrun ) cores=4; queue=threaded; run_time=48h; mpp=3.0g; fslrun=True;;
+         -h | --help ) printUsage; exit 0;;
+          * ) echo "unrecognized option: $1"; printUsage; exit 1;;
+       esac
+       shift
+done
+# fsl gpu args were:
+#   --fslrun ) cores=4; queue=gpu; run_time=2h; mpp=2.0g; fslrun=True;;
+
+
+# Finish processing args
+site_dir="${1%/}"
+
+# Function to check sqsub args and submit job
+function submit_sq_job {
+    # arguments for sqsub and probtrack_prep
+    sub_args=(-o "$log_file" -r ${run_time} -q ${queue} -n ${cores} --mpp=${mpp})
+    if [[ $fslrun == True ]]; then
+        # 4 threads example: sqsub -v -q gpu -f threaded --gpp=1 -n4 -N1 -r 1h -o <OUTFILE> <JOB>
+        #sub_args+=(-f threaded --gpp=1 -N 1)
+        cmd_args+=(--noafni)
+    elif [[ $afnirun == True ]]; then
+        cmd_args+=(--nobpx)
+    fi
+    [[ -n $node_id ]] && sub_args+=(--nodes="$node_id")
+
+    # report and check args
+    if [[ $run_sqsub == True ]]; then
+        echo "Running probtrack_prep with args:"
+    else
+        echo "Would run probtrack_prep with args:"
+    fi
+    echo "  ${cmd_args[@]} --sn ${sub_args[@]}"
+
+    for chars in "${sub_args[@]}" "${cmd_args[@]}"; do
+        [[ -z $chars ]] && { echo "found zero length arg!"; exit 2; }
+    done
+
+    # nchars=$(echo "${cmd_args[@]}" | wc -c)
+    # [[ $nchars -gt 199 ]] && { echo "characters in command exceeds 200. aborting..."; exit 2; }
+    # N.B. according to this [ticket][1], the 200 char limit is not really a problem, other than aesthetics
+    # [1] https://www.sharcnet.ca/my/problems/ticket/18182
+
+    # for parallel fsl_sub, limit it to proper number of threads, not cores on node
+    #if [[ $cores == 1 || $fslrun == True ]]; then
+    if [[ $cores == 1 ]]; then
+        export FSLPARALLEL=0
+    else
+        export FSLPARALLEL=$cores
+    fi
+
+    # go!
+    if [[ $run_sqsub == True ]]; then
+        /home/davisad/work/CAN-BIND_DTI/bin/probtrack_prep "${cmd_args[@]}" --sn "${sub_args[@]}" 
+        #sqsub "${sub_args[@]}" "${cmd_args[@]}"
+    fi
+
+    # check command success
+    rc=$?
+    [[ $rc -ne 0 ]] && { echo "got return code: $rc. aborting..."; exit 3; }
+}
+
+# Use check_mode to find failed runs
+if [[ $check_mode == True ]]; then
+    echo "check_mode: finding bpx_job.log files..."
+    logs_to_check=($(find "${site_dir}" -name bpx_job.log))
+
+    if [[ ${#logs_to_check[@]} == 0 ]]; then
+        echo "no bpx_job.log files found in ${site_dir}"
+        exit 1
+    fi
+
+    # inform user and make appropriate format string for output
+    echo "checking ${#logs_to_check[@]} bpx_job.log files..."
+    test_str=${logs_to_check[0]%/dti_preprocessed/bpx_job.log}
+    format_str="%${#test_str}s %11s\n"
+
+    nz_logs_found=False
+    success_cnt=0
+    for lf in "${logs_to_check[@]}"; do
+        exit_status=$(grep -A 2 -- "--- SharcNET Job Epilogue ---" "$lf" | tail -1 | tr -s ' ' | cut -d ' ' -f 4)
+
+        if [[ -n $exit_status ]]; then
+            if [[ $exit_status == 0 ]]; then
+                # count successful runs
+                ((success_cnt++))
+            else
+                # report exit status of unsuccessful runs
+                if [[ $nz_logs_found == False ]]; then
+                    printf "$format_str" subj_path exit_code
+                    nz_logs_found=True
+                fi
+                printf "$format_str" "${lf%/dti_preprocessed/bpx_job.log}" $exit_status
+            fi
+        elif grep "job killed" "$lf" >/dev/null || grep "Terminated" "${lf%bpx_job.log}probtrack_prep.log" >/dev/null ; then
+		if [[ $nz_logs_found == False ]]; then
+                    printf "$format_str" subj_path exit_code
+                    nz_logs_found=True
+                fi
+		printf "$format_str" "${lf%/dti_preprocessed/bpx_job.log}" killed
+        fi
+    done
+
+    [[ $nz_logs_found == False ]] && echo "  no non-zero exit codes found."
+    [[ $success_cnt -gt 0 ]] && echo "  successful runs with exit code 0: $success_cnt"
+    exit 0
+elif [[ $nobpxchk_mode == True ]]; then
+    if [[ -d "${site_dir}" ]]; then
+        cd "${site_dir}"
+    else
+        echo "Dir not found: ${site_dir}"
+        exit 2
+    fi
+    if [[ -d dti_preprocessed ]]; then
+        echo "nobpxchk_mode: re-running probtrack_prep in $PWD"
+        if [[ -d dti_preprocessed/bedpostx_output ]]; then
+            echo "  found dti_preprocessed/bedpostx_output."
+            echo "  are you sure you want to re-run?"
+            echo "  aborting..."
+            exit 1
+        fi
+
+        # check for files from previous run and clean up if necessary
+        #files_to_clean=(bpx_job.log dti-afni_dwuncert.nii.gz bedpostx_input.bedpostX bedpostx_input probtrack_prep.log)
+        files_to_clean=(bedpostx_input.bedpostX bedpostx_input)
+        found_files=()
+        for f in "${files_to_clean[@]}"; do
+            if [[ -e "dti_preprocessed/$f" ]]; then
+                found_files+=("dti_preprocessed/$f")
+            fi
+        done
+
+        if [[ ${#found_files[@]} -gt 0 ]]; then
+            echo "  cleaning old files: ${found_files[@]}"
+            /bin/rm -rI "${found_files[@]}"
+        fi
+
+        # set up new run and submit job
+        log_file=dti_preprocessed/bpx_job.log
+        cmd_args=(--nominip --nobpxchk)
+
+        submit_sq_job
+        exit 0
+    else
+        echo "nobpxchk_mode: dti_preprocessed dir not found in $PWD"
+        exit 2
+    fi
+fi
+
+# Gather list of dti_preprocessed directories
+echo "Searching for dti_prep dirs..."
+data_dir="/${base_dir}/davisad/CAN-BIND_DTI/data/${data_phase}/${site_dir}"
+ppd_list=($(find "$data_dir" -maxdepth 2 -name dti_preprocessed -type d | sort))
+echo "  Found ${#ppd_list[@]}."
+[[ ${#ppd_list[@]} -gt 0 ]] || { echo "no ppds found in ${PWD}"; exit 2; }
+
+# Iterate the subject directories and submit jobs
+skipped_cnt=0
+submitted_cnt=0
+for prepdir in "${ppd_list[@]}"; do
+    subjdir=$(dirname "$prepdir")
+    pushd "$subjdir"
+
+    # define log file, check subject hasn't already been run (or started)
+    log_file=dti_preprocessed/bpx_job.log
+    #if [[ -e $log_file ]]; then
+    #    echo "log file exists: ${PWD}/$log_file. skipping..."
+    #    ((skipped_cnt++))
+    #    popd > /dev/null
+    #    continue
+    skip_trial=False
+    if [[ -e dti_preprocessed/probtrack_prep.log ]]; then
+        if [[ $afnirun == True ]] && [[ -e dti_preprocessed/dti-afni_dwuncert.nii.gz ]]; then
+            echo "AFNI output files present. skipping..."
+            skip_trial=True
+        elif [[ $fslrun == True ]] && [[ -d dti_preprocessed/bedpostx_input ]]; then
+            echo "bedpostx_input dir exists. skipping..."
+            skip_trial=True
+        elif [[ ! $fslrun == True ]] && [[ ! $afnirun == True ]]; then
+            echo "probtrack_prep.log exists. skipping..."
+            skip_trial=True
+        fi
+    fi
+
+    if [[ $skip_trial == True ]]; then
+        ((skipped_cnt++))
+        popd > /dev/null
+        continue
+    fi
+
+    # gather arguments to recon-all and submit
+    ((submitted_cnt++))
+    cmd_args=(--nominip)
+
+    submit_sq_job
+    popd > /dev/null
+done
+
+echo ""
+echo "Done:"
+echo "  ${#ppd_list[@]} dti_preprocessed dirs found"
+echo "  ${skipped_cnt} skipped"
+if [[ $run_sqsub == True ]]; then
+    echo "  ${submitted_cnt} submitted"
+else
+    echo "  ${submitted_cnt} would have been submitted"
+fi

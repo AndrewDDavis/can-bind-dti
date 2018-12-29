@@ -1,0 +1,67 @@
+#!/usr/bin/env python
+"""not intended as a module"""
+from __future__ import division
+import plac
+
+@plac.annotations(
+    pars_file="CSV file with 13 columns of MC parameters"
+    )
+
+def main(pars_file):
+    """This script takes one argument: a xfmpars file, which was output by
+    FSL's eddy_correct, the dti_preprocess script, and mcmats2csv.
+
+    Writes output to the qc dir, as dwi_ecc-xfmPars-rms_dspl_b0mean.csv, b0std
+    and b1mean/std.
+
+    Example: mcpars_calcd dti_preprocessed/dwi_ecc-xfmPars.csv
+    """
+
+    import os
+    import numpy as np
+    import csv
+
+    assert os.path.isfile(pars_file)        # assert file exists
+
+    A = np.genfromtxt(pars_file, names=True)
+    r=7.5
+    x = A['TransX'] + r*A['RotY']
+    y = A['TransY'] + r*A['RotZ']
+    z = A['TransZ'] + r*A['RotX']
+    d = np.sqrt(x**2 + y**2 + z**2)
+
+    # output to file named similar to input
+    qc_dir = pars_file[:-19] + 'qc/'
+    assert os.path.isdir(qc_dir)
+    arr_fn = qc_dir + 'dwi_ecc-xfmPars-rms_dspl.csv'
+    mean_fn = qc_dir + 'dwi_ecc-xfmPars-rms_dspl_mean.csv'
+
+    np.savetxt(arr_fn, d, fmt='%.3f')
+    with open(mean_fn, 'w') as f:
+        f.write("{:0.2f}\n".format(d.mean()))
+
+    # output for only b=0 images
+    bval_file = pars_file[:-19] + 'dwi_merged.bval'
+    assert os.path.isfile(bval_file)
+    bvals = np.genfromtxt(bval_file)    # 37 element array
+
+    meanb0_fn = qc_dir + 'dwi_ecc-xfmPars-rms_dspl_b0mean.csv'
+    meanb1_fn = qc_dir + 'dwi_ecc-xfmPars-rms_dspl_b1mean.csv'
+
+    with open(meanb0_fn, 'w') as f:
+        f.write("{:0.2f}\n".format(d[bvals == 0].mean()))
+    with open(meanb1_fn, 'w') as f:
+        f.write("{:0.2f}\n".format(d[bvals != 0].mean()))
+
+    stdb0_fn = qc_dir + 'dwi_ecc-xfmPars-rms_dspl_b0std.csv'
+    stdb1_fn = qc_dir + 'dwi_ecc-xfmPars-rms_dspl_b1std.csv'
+
+    with open(stdb0_fn, 'w') as f:
+        f.write("{:0.2f}\n".format(d[bvals == 0].std()))
+    with open(stdb1_fn, 'w') as f:
+        f.write("{:0.2f}\n".format(d[bvals != 0].std()))
+
+
+# Entry point
+if __name__ == '__main__':
+    plac.call(main)

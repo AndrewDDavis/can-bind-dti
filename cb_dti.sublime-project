@@ -1,0 +1,17 @@
+{
+	"folders":
+	[
+		{
+			"path": "bin"
+		},
+		{
+			"path": "src"
+		},
+		{
+			"path": "doc"
+		},
+		{
+			"path": "group_results"
+		}
+	]
+}

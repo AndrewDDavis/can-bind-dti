@@ -1,0 +1,178 @@
+#!/usr/bin/env python2
+# coding: utf-8
+""" intended to be run from the command line, not as a module """
+
+__author__ = "Andrew Davis (addavis@gmail.com)"
+__version__ = "0.11 (Jul 2017)"
+__license__ = "Distributed under The MIT License (MIT).  See http://opensource.org/licenses/MIT for details."
+
+import plac
+import os.path
+import re
+#import sys, os
+#import numpy as np
+#import matplotlib.pyplot as plt
+#import scipy.signal as sp  # etc...
+
+@plac.annotations()
+
+def main():
+    """Pulls values from the stats file after dti_preprocess and dti_qc have been run.
+
+    Run from an exam directory. So can run from a site directory like:
+
+    for d in CBN01_*/; do
+        cd "$d"
+        pull_dti_stats || break
+        cd ..
+    done
+
+    or
+
+    # from Data_Phase_AB dir
+    dirs -c     # clear dir stack
+    for p in $(find . -maxdepth 3 -name dti_preprocessed | sort); do
+        d=$(dirname "$p")
+        pushd "$d"
+        pull_dti_stats || break
+        popd > /dev/null
+    done
+
+    Then it populates the site file in ../../../group_results.
+
+    """
+
+    # I/O
+    working_dir = os.path.basename(os.getcwd()) # e.g. CBN01_MCU_0029_01_SE01_MR
+    site = working_dir[6:9]     # e.g. MCU 
+    subj = working_dir[6:14]    # e.g. MCU_0029
+    vis = working_dir[15:17]    # e.g. 01
+    stats_file = "./dti_preprocessed/qc/dti_preprocess_stats.txt"       # input file
+    out_dir = os.path.expanduser("~/Documents/CAN-BIND/CAN-BIND_DTI/group_results")
+    out_file = out_dir + "/dti_preprocess_stats-" + site + ".csv"       # output file
+
+    assert os.path.isfile(stats_file), "stats file not found in dir: {}".format(working_dir)
+    assert os.path.isdir(out_dir), "output dir not found: {}".format(out_dir)
+
+    # Set up output file columns
+    #          exam        subj       vis        fsl_tx      fsl_measures        afni_tx + fnv  afni_measures
+    col_str = "{:<28} " + "{:<8} " + "{:<6} " + "{:>12} " + "{:>12} {:<6} "*8 + "{:>12} "*2 + "{:>12} {:<6}"*3 + "\n"   # 28 cols!
+    outfile_dir = os.path.dirname(out_file)
+    if not os.path.isdir(outfile_dir):
+        os.makedirs(outfile_dir)
+
+    if not os.path.isfile(out_file):
+        with open(out_file, 'w') as of:
+            of.write(col_str.format("Exam", "Subject", "Visit", "FSL_tracts",
+                                    "Atlas_FA", "SD", "FSL_WM_FA", "SD", "FSL_WM_MD", "SD", "FSL_WM_SSE", "SD",
+                                    "FSL_CSF_FA", "SD", "FSL_CSF_MD", "SD", "FSL_GM_FA", "SD", "FSL_GM_MD", "SD",
+                                    "AFNI_tracts", "AFNI_fNV", "AFNI_FA", "SD", "AFNI_MD", "SD", "AFNI_RD", "SD"))
+
+    with open(stats_file, 'r') as sf:
+        lines = [line.rstrip('\n') for line in sf]
+
+    # use REs to match values from lines
+    for line in lines:
+        if line and not line.isspace():    # Check for empty lines
+            m = re.search(r'FSL stats from rough masks:', line)
+            if m:
+                continue
+
+            m = re.search(r'no. tracts: ([0-9]+)', line)
+            if m:
+                fsl_tracts = m.group(1)
+                continue
+
+            m = re.search(r'atlas_FA: ([0-9\.]+) \(([0-9\.]+)\)', line)
+            if m:
+                fsl_atlas_fa = m.group(1)
+                fsl_atlas_fa_sd = m.group(2)
+                continue
+
+            m = re.search(r'WM_FA: ([0-9\.]+) \(([0-9\.]+)\)', line)
+            if m:
+                fsl_wm_fa = m.group(1)
+                fsl_wm_fa_sd = m.group(2)
+                continue
+
+            m = re.search(r'WM_MD: ([0-9\.]+) \(([0-9\.]+)\)', line)
+            if m:
+                fsl_wm_md = m.group(1)
+                fsl_wm_md_sd = m.group(2)
+                continue
+
+            m = re.search(r'WM_SSE: ([0-9\.]+) \(([0-9\.]+)\)', line)
+            if m:
+                fsl_wm_sse = m.group(1)
+                fsl_wm_sse_sd = m.group(2)
+                continue
+
+            m = re.search(r'CSF_FA: ([0-9\.]+) \(([0-9\.]+)\)', line)
+            if m:
+                fsl_csf_fa = m.group(1)
+                fsl_csf_fa_sd = m.group(2)
+                continue
+
+            m = re.search(r'CSF_MD: ([0-9\.]+) \(([0-9\.]+)\)', line)
+            if m:
+                fsl_csf_md = m.group(1)
+                fsl_csf_md_sd = m.group(2)
+                continue
+
+            m = re.search(r'GM_FA: ([0-9\.]+) \(([0-9\.]+)\)', line)
+            if m:
+                fsl_gm_fa = m.group(1)
+                fsl_gm_fa_sd = m.group(2)
+                continue
+
+            m = re.search(r'GM_MD: ([0-9\.]+) \(([0-9\.]+)\)', line)
+            if m:
+                fsl_gm_md = m.group(1)
+                fsl_gm_md_sd = m.group(2)
+                continue
+
+            m = re.search(r'AFNI stats from afni-generated masks:', line)
+            if m:
+                continue
+
+            m = re.search(r'AFNI tracts: ([0-9]+)', line)
+            if m:
+                afni_tracts = m.group(1)
+                continue
+
+            m = re.search(r'afni_fNV: ([0-9\.]+)', line)
+            if m:
+                afni_fnv = m.group(1)
+                continue
+
+            m = re.search(r'afni_FA: ([0-9\.]+) \(([0-9\.]+)\)', line)
+            if m:
+                afni_wm_fa = m.group(1)
+                afni_wm_fa_sd = m.group(2)
+                continue
+
+            m = re.search(r'afni_MD: ([0-9\.]+) \(([0-9\.]+)\)', line)
+            if m:
+                afni_wm_md = m.group(1)
+                afni_wm_md_sd = m.group(2)
+                continue
+
+            m = re.search(r'afni_RD: ([0-9\.]+) \(([0-9\.]+)\)', line)
+            if m:
+                afni_wm_rd = m.group(1)
+                afni_wm_rd_sd = m.group(2)
+                continue
+
+            raise Exception("No match found for line in {}:\n{}".format(working_dir, line))
+
+
+    with open(out_file, 'a') as of:
+        of.write(col_str.format(working_dir, subj, vis, fsl_tracts,
+                                fsl_atlas_fa, fsl_atlas_fa_sd, fsl_wm_fa, fsl_wm_fa_sd, fsl_wm_md, fsl_wm_md_sd, fsl_wm_sse, fsl_wm_sse_sd,
+                                fsl_csf_fa, fsl_csf_fa_sd, fsl_csf_md, fsl_csf_md_sd, fsl_gm_fa, fsl_gm_fa_sd, fsl_gm_md, fsl_gm_md_sd,
+                                afni_tracts, afni_fnv, afni_wm_fa, afni_wm_fa_sd, afni_wm_md, afni_wm_md_sd, afni_wm_rd, afni_wm_rd_sd))
+
+
+# Entry point
+if __name__ == '__main__':
+    plac.call(main)

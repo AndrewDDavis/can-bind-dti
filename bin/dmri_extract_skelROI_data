@@ -1,0 +1,175 @@
+#!/bin/bash
+
+# v0.1 (April 2018) by Andrew Davis (addavis@gmail.com)
+
+print_usage () {
+cat << EOF
+
+    $(basename $0)
+    -------------------------
+    This script processes skeletonized MRI data to extract the 40-ROI JHU
+    values, and the mean and peripheral skeleton ROI data.
+
+    See "DTI ROI analysis notes".
+
+    Usage:
+        $(basename $0) visit_code metric
+
+    Arguments
+    ---------
+      - visit_code: cohort to use; one of {1,12,13,123}
+      - metric: type of data; one of {FA, MD, etc}
+
+EOF
+}
+
+# Robust script options
+set -o nounset    # fail on unset variables
+set -o errexit    # fail on non-zero return values
+set -o pipefail   # fail if any piped command fails
+
+# Red error messages, etc
+[[ -f ~/.bash_script_messages ]] \
+  && source ~/.bash_script_messages \
+  || scriptEcho() { shift $(($#-1)); echo "$1"; }
+
+# Defaults
+proj_dir=~/Documents/Research_Projects/CAN-BIND_DTI
+rois_dir=${proj_dir}/data/ROIs
+gr_res_dir=${proj_dir}/group_results
+
+# Arguments
+[[ $# -eq 0 ]] && { print_usage; exit 1; }
+[[ $# -eq 2 ]] || { scriptEcho -e "expected 2 args."; exit 2; }
+
+vis_code=$1 && shift
+[[ $vis_code == 1 || $vis_code == 12 || $vis_code == 13 || $vis_code == 123 ]] \
+  || { scriptEcho -e "unrecognized visit code: $vis_code"; exit 2; }
+
+metric=$1 && shift
+
+# Temp dir to hold intermediate files
+tmp_dir=$(mktemp --tmpdir -d "ca.spinup.$(basename $0)_pid$$.XXXXX")
+
+# Parse visit code
+if [[ $vis_code == 1 ]]; then
+    # subjid_list_file=${gr_res_dir}/cohort_csvs/subjid_list-v01.txt
+    visit_list_file=${gr_res_dir}/cohort_csvs/visit_list-v01.txt
+    skel_dir=${proj_dir}/data/merged_skel_v01
+# elif [[ $vis_code == 12 ]]; then
+# elif [[ $vis_code == 13 ]]; then
+elif [[ $vis_code == 123 ]]; then
+    # subjid_list_file=${gr_res_dir}/cohort_csvs/subjid_list-v01v02v03.txt
+    visit_list_file=${gr_res_dir}/cohort_csvs/visit_list-v01v02v03.txt
+    skel_dir=${proj_dir}/data/merged_skel_v01v02v03
+fi
+
+# Check sensible conditions
+[[ -d $skel_dir ]] || { scriptEcho -e "dir not found: $skel_dir"; exit 2; }
+# [[ -f "$subjid_list_file" ]] || { scriptEcho -e "file not found: $subjid_list_file"; exit 2; }
+[[ -f "$visit_list_file" ]] || { scriptEcho -e "file not found: $visit_list_file"; exit 2; }
+
+out_dir=${gr_res_dir}/$(basename $skel_dir)
+[[ -d $out_dir ]] || mkdir -p $out_dir
+
+# Get number of visits we're working with
+# N.B. used to do:
+#   fa_niis=($(find subprojects -path '*/*/*_01/dti_preprocessed/jhu-space/dti-fsl_FA-jhusp.nii.gz' | sort))
+n=$(wc -l $visit_list_file | cut -d ' ' -f 1)
+
+# subjid_list=($(cat "$subjid_list_file"))
+# scriptEcho "Parsing $n visit IDs ..."
+
+# # write out subjids with _01 glob
+# for sid in ${subjid_list[@]}; do
+#     echo "${sid}"${nameglob} >> ${tmp_dir}/visit_ids_col.txt
+#     exit 99
+#     # read this from visit_list_file=${gr_res_dir}/cohort_csvs/visit_list-v01v02v03.txt
+# done
+
+# Extract JHU ROI data from skeletonized data for $metric
+#   N.B. This code adapted from dti_extract_ROIdata
+scriptEcho "Extracting 40-ROI $metric values for $n visits into ${out_dir}/ ..."
+outfile=${out_dir}/JHU-40ROI_skel_${metric}_data.csv
+
+# printf "subjID," > "$outfile"
+# # Get ROI names from index
+# for r in "${rois_dir}"/40_ROIs/ROI-[0-9][0-9].nii.gz; do
+#     r_no=$(basename ${r%.nii.gz})
+#     r_no=${r_no#ROI-}
+#     r_name="$(grep "^${r_no}" "${rois_dir}"/JHU-40_ROIs_selected.txt)"
+#     r_name="$(echo "${r_name#[0-9][0-9] }" | tr ' ' '_' | tr -d '()' | sed 's/\/_//')"
+#     [[ -n "${r_name:-}" ]] || { echo "ERROR: empty r_name"; exit 2; }
+#     printf "${r_name}," >> "$outfile"
+# done
+# sed --in-place '$ s/,$//' "$outfile"  # strip trailing comma
+# printf "\n" >> "$outfile"
+
+# print this manually since it never changes, uncomment above to generate dynamically
+echo "subjID,Genu_of_corpus_callosum,Body_of_corpus_callosum,Splenium_of_corpus_callosum,Fornix_column_and_body_of_fornix,Superior_cerebellar_peduncle_R,Superior_cerebellar_peduncle_L,Cerebral_peduncle_R,Cerebral_peduncle_L,Anterior_limb_of_internal_capsule_R,Anterior_limb_of_internal_capsule_L,Posterior_limb_of_internal_capsule_R,Posterior_limb_of_internal_capsule_L,Retrolenticular_part_of_internal_capsule_R,Retrolenticular_part_of_internal_capsule_L,Anterior_corona_radiata_R,Anterior_corona_radiata_L,Superior_corona_radiata_R,Superior_corona_radiata_L,Posterior_corona_radiata_R,Posterior_corona_radiata_L,Posterior_thalamic_radiation_include_optic_radiation_R,Posterior_thalamic_radiation_include_optic_radiation_L,Sagittal_stratum_include_inferior_longitidinal_fasciculus_and_inferior_fronto-occipital_fasciculus_R,Sagittal_stratum_include_inferior_longitidinal_fasciculus_and_inferior_fronto-occipital_fasciculus_L,External_capsule_R,External_capsule_L,Cingulum_cingulate_gyrus_R,Cingulum_cingulate_gyrus_L,Cingulum_hippocampus_R,Cingulum_hippocampus_L,Fornix_cres_Stria_terminalis_can_not_be_resolved_with_current_resolution_R,Fornix_cres_Stria_terminalis_can_not_be_resolved_with_current_resolution_L,Superior_longitudinal_fasciculus_R,Superior_longitudinal_fasciculus_L,Superior_fronto-occipital_fasciculus_could_be_a_part_of_anterior_internal_capsule_R,Superior_fronto-occipital_fasciculus_could_be_a_part_of_anterior_internal_capsule_L,Uncinate_fasciculus_R,Uncinate_fasciculus_L,Tapetum_R,Tapetum_L" > "$outfile"
+
+# Now print the values column-wise to combine later
+# N.B. need non-zero mean (-M) when operating on skeletonized images
+# N.B. fslstats gives only 6 digits of precision (after decimal) which is problematic
+#        for MD values (~0.0006XX), that can look identical across time-points!
+#        - fslmeants has the same precision problem
+#        - so does AFNI's 3dmaskave
+#
+# Solution: multiply non-FA images by 1000 before extraction of values. This was done
+#   in dmri_skeletonize
+for r in ${rois_dir}/40_ROIs/ROI-[0-9][0-9].nii.gz; do
+    rbn="$(basename ${r%.nii.gz})"
+    fslstats -t ${skel_dir}/all_${metric}_skeletonised \
+             -k "$r" \
+             -M \
+             | tr -d ' ' \
+             > ${tmp_dir}/${rbn}_${metric}_col.txt
+done
+
+# Check number of generated values matches visits list
+#   (ROI-24 used as an example -- all will be the same)
+m=$(wc -l ${tmp_dir}/ROI-24_${metric}_col.txt | cut -d ' ' -f 1)
+[[ $n -eq $m ]] || { scriptEcho -e "$n visits, but $m values for ROI-24"; exit 2; }
+
+
+# Combine ROI columns with visit IDs into CSV file
+paste -d ',' \
+      $visit_list_file \
+      ${tmp_dir}/ROI-[0-9][0-9]_${metric}_col.txt \
+      >> "$outfile"
+
+
+# Now mean values from the skeleton and periphery
+scriptEcho "Extracting skeleton and periphery values for ${metric} ..."
+fslstats -t ${skel_dir}/all_${metric}_skeletonised \
+         -k ${skel_dir}/mean_FA_skeleton_mask \
+         -m \
+         | tr -d ' ' \
+         > ${tmp_dir}/skel_${metric}_col.txt
+paste -d ',' \
+      $visit_list_file \
+      ${tmp_dir}/skel_${metric}_col.txt \
+      > ${out_dir}/skel_mean${metric}_data.csv
+
+fslstats -t ${skel_dir}/all_${metric}_skeletonised \
+         -k ${skel_dir}/mean_FA_skelperiphery_R \
+         -m \
+         | tr -d ' ' \
+         > ${tmp_dir}/skelperiph_R_${metric}_col.txt
+paste -d ',' \
+      $visit_list_file \
+      ${tmp_dir}/skelperiph_R_${metric}_col.txt \
+      > ${out_dir}/skelperiph_R_mean${metric}_data.csv
+
+fslstats -t ${skel_dir}/all_${metric}_skeletonised \
+         -k ${skel_dir}/mean_FA_skelperiphery_L \
+         -m \
+         | tr -d ' ' \
+         > ${tmp_dir}/skelperiph_L_${metric}_col.txt
+paste -d ',' \
+      $visit_list_file \
+      ${tmp_dir}/skelperiph_L_${metric}_col.txt \
+      > ${out_dir}/skelperiph_L_mean${metric}_data.csv
+
+# Clean up
+rm -rf ${tmp_dir}
